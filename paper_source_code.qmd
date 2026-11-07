@@ -1,0 +1,4664 @@
+---
+title: 'Source code for the study entitled *Environmental DNA survey reveals scale-dependent fish community assembly processes under non-native fish invasion*'
+format: html
+output-file: eDNA reveals fish assembly under invasion
+toc: true
+embed-resources: true
+toc-expand: true
+---
+
+## Preparation
+Load package
+```{r}
+#| warning: false
+
+set.seed(202601)
+library(conflicted)
+conflict_prefer("filter", "dplyr")
+conflict_prefer("lag", "dplyr")
+
+library(tidyverse)
+library(vegan)
+library(sf)
+library(ggspatial)
+library(patchwork)
+library(rtrees)
+library(ape)
+library(ggtree)
+library(ggrepel)
+library(plotly)
+library(picante)
+library(mgcv)
+library(terra)
+library(tidyterra)
+library(iCAMP)
+library(gt)
+library(ecodist)
+library(cluster)
+library(ggnewscale)
+library(svglite)
+library(furrr)
+library(iNEXT)
+library(RcppAlgos)
+library(minpack.lm)
+```
+
+Custom function
+```{r}
+
+mfd <- function(x){formatC(x, format = "d", big.mark = ",")}
+mff <- function(x,y=1){formatC(x*100, format = "f", digits = y)}
+
+mfc <- function(x){
+  rsum <- rowSums(x)>0
+  csum <- colSums(x)>0
+  x[rsum,csum]
+}
+
+mf_cal_domi <- function(x){
+  {colSums(x)/sum(x)*colSums(x>0)/nrow(x)} %>% 
+    enframe(name="species",value="domi")
+}
+
+mf_change_str <- function(x, df, out = 2) {
+  from <- df[[3 - out]]
+  to   <- df[[out]]
+  i <- match(x, from)
+  x[!is.na(i)] <- to[i[!is.na(i)]]
+  x
+}
+
+mf_get_idx <- function(sample_coord, sub_rep=100,seed=NULL){
+  max_sample <- nrow(sample_coord)
+  map(
+    seq.int(1L, max_sample),
+    function(i){
+      sub_rep_real <- min(sub_rep,choose(max_sample, i))
+      
+      idx_sub <- comboSample(
+        v=seq_len(max_sample), 
+        m=i, 
+        n=sub_rep_real,
+        seed=seed
+      ) %>% 
+        asplit(1)
+    }
+  )
+}
+
+mf_cal_area <- function(sample_coord,idx,buf=1000){
+  x <- sample_coord[, 1]
+  y <- sample_coord[, 2]
+  map(
+    idx,
+    function(i){
+      sample_area <- map_dbl(
+        i,
+        function(k){
+          xk <- x[k]
+          yk <- y[k]
+          hull <- chull(xk, yk)
+          nh <- length(hull)
+          xh <- xk[hull]
+          yh <- yk[hull]
+          
+          a0 <- pi*buf^2
+          al <- 0
+          ah <- 0
+          
+          if(nh>1){
+            al <- buf*sum(sqrt(diff(c(xh,xh[1]))^2+diff(c(yh,yh[1]))^2))
+          }
+          
+          if(nh>2){
+            ah <- abs(
+              sum(xh*c(yh[-1],yh[1]) - yh*c(xh[-1],xh[1]))
+            )*0.5
+          }
+          
+          a <- (a0+al+ah)*1e-6
+          
+          return(a)
+        }
+      )
+      dat <- tibble(
+        sample_n=length(i[[1]]),
+        sample_area=sample_area,
+        intensity=sample_n/sample_area
+      )
+      return(dat)
+    }
+  ) %>% 
+    list_rbind()
+}
+
+mf_cal_sp <- function(fish_mat,idx){
+  map(
+    idx,
+    function(i,j){
+      max_sample <- nrow(fish_mat)
+      sub_rep_real <- length(i)
+      subsample_mat <- matrix(
+        F, 
+        nrow = sub_rep_real, 
+        ncol = max_sample
+      )
+      row_idx <- rep(seq_len(sub_rep_real),each=length(i[[1]]))
+      col_idx <- unlist(i)
+      subsample_mat[cbind(row_idx,col_idx)] <- T
+      sp <- rowSums((subsample_mat %*% fish_mat)>0)
+      return(sp)
+    }
+  ) %>% 
+    list_c()
+}
+
+mf_sp_pi <- function(Spec,nT,Q0_hat){
+  Sobs <- sum(Spec > 0)
+  Q0_int <- ceiling(Q0_hat)
+  Q1 <- sum(Spec == 1)
+  Q2 <- sum(Spec == 2)
+  A <- ifelse(Q1 > 0, nT * Q0_hat/(nT * Q0_hat + Q1), 1)
+  a <- Q1/nT * A
+  b <- sum(Spec/nT * (1 - Spec/nT)^nT)
+  if (Q0_hat == 0) {
+    w <- 0
+    if (Sobs == 1) {
+      warning("This site has only one species. Estimation is not robust.")
+    }
+  }
+  else {
+    w <- a/b
+  }
+  Prob_hat <- Spec/nT * (1 - w * (1 - Spec/nT)^nT)
+  Prob_hat_Unse <- rep(a/Q0_int, Q0_int)
+  Prob_hat_Unse <- setNames(
+    Prob_hat_Unse,
+    paste0("unkown_species",seq.int(Sobs+1,Sobs+Q0_int))
+  )
+  return(c(Prob_hat, Prob_hat_Unse))
+}
+
+mf_bc_ci <- function(x, theta_hat, probs = c(0.025, 0.975)) {
+  z0 <- qnorm(mean(x<theta_hat))
+  adj <- pnorm(2*z0 + qnorm(probs))
+  quantile(x, adj)
+}
+```
+
+Read data
+```{r}
+sample_info <- read_csv(
+  "./input/sample_info.csv",
+  show_col_types = FALSE
+) %>% 
+  mutate(
+    habitat = factor(
+      habitat,
+      levels=c("river","reservoir","tidal"),
+      labels=c("river","reservoir","tidal")
+    ),
+    season=case_when(
+      month == 1 ~ "Winter",
+      month %in% c(4,5) ~ "Spring",
+      month == 7 ~ "Summer",
+      month == 10~ "Autumn"
+    ),
+    season=factor(
+      season,
+      levels=c("Spring","Summer","Autumn","Winter")
+    ),
+    site=as.factor(site)
+  )
+
+fish_table <- read_csv(
+  "./input/fish_table.csv",
+  show_col_types = FALSE
+) %>% 
+  column_to_rownames("exp_id")
+
+fish_info <- read_csv(
+  "./input/fish_info.csv",
+  show_col_types = FALSE
+)
+```
+
+Read tracking in metabarcoding data processing
+```{r}
+read_track <- list.files(
+  "./input/sequence/01_merged/", 
+  pattern = ".txt", 
+  full.names = T
+) %>% 
+  map(
+    ~read_lines(.x) %>% 
+      str_subset("\\s+\\d+\\s+Pairs|\\s+\\d+\\s+Merged") %>% 
+      str_extract("(\\d+).*\\(",1) %>% 
+      as.numeric()
+  ) %>% 
+  reduce(`+`) %>% 
+  set_names("total","merged")
+
+read_track["filtered"] <- list.files(
+  "./input/sequence/03_filtered", 
+  pattern = ".txt", 
+  full.names = T
+) %>% 
+  map_dbl(
+    ~read_lines(.x) %>% 
+      str_subset("^\\s+\\d+\\s+Filtered reads \\(") %>% 
+      str_extract("^\\s+(\\d+)\\s+Filtered reads",1) %>% 
+      as.numeric()
+  ) %>% 
+  sum()
+
+read_track[c("zotu","zotu_read")] <- read_csv(
+  "./input/sequence/Zotu_seq_table.csv",
+  col_select = -c(1,2),
+  show_col_types = F
+) %>% 
+  summarise(zotu=n(),zotu_read=sum(.)) %>% 
+  unlist()
+
+read_track["fish"] <- fish_table %>% ncol()
+
+read_track["fishread_all"] <- fish_table %>% sum()
+
+fish_table <- fish_table %>% 
+  filter(
+    rownames(.) %in% pull(
+      sample_info %>% filter(type=="sample"),
+      exp_id
+    )
+  )
+
+read_track["fishread_without_nc"] <- fish_table %>% sum()
+
+read_track["contami_ratio"] <- (
+  read_track["fishread_all"]-read_track["fishread_without_nc"]
+)/
+  sum(sample_info$type!="sample")/
+  (
+    read_track["fishread_without_nc"]/
+      sum(sample_info$type=="sample")
+  )
+```
+
+## w01_read
+Rarefaction curve based on sample reads
+```{r}
+w01_read <- list()
+
+w01_read$dat <- fish_table %>% 
+  rarecurve(step=100,tidy=T)
+
+w01_read$fig <- ggplot(
+  data=w01_read$dat,
+  aes(x=Sample,y=Species,col=Site)
+)+
+  geom_line(linewidth=0.3,alpha=0.5)+
+  theme_bw()+
+  theme(
+    legend.position = "none",
+    text=element_text(family = "serif")
+  )+
+  xlab("Reads")+
+  ylab("Richness")
+
+```
+
+Data cleaning of fish community
+```{r}
+read_track["sample_drop"] <- sum(rowSums(fish_table)<15000)
+fish_table <- fish_table %>% 
+  filter(rowSums(.)>=15000) %>% 
+  mfc()
+
+sample_info <- sample_info %>% 
+  filter(exp_id%in%rownames(fish_table))
+```
+
+Sequencing yielded a total of `r mfd(read_track["total"])` raw reads. Assembly produced `r mfd(read_track["merged"])` reads (`r mff(read_track["merged"]/read_track["total"])`%). Quality filtering resulted in `r mfd(read_track["filtered"])` reads (`r mff(read_track["filtered"]/read_track["total"])`%). Denoising yielded `r mfd(read_track["zotu"])` ZOTUs, with a total of `r mfd(read_track["zotu_read"])` reads (`r mff(read_track["zotu_read"]/read_track["total"])`%) matched to ZOTUs. All ZOTUs were classified and identified based on the Mitofish database, and reads from the same fish species in the same sample were merged. A total of `r mfd(read_track["fish"])` fish taxa were identified, with a total of `r mfd(read_track["fishread_all"])` reads (`r mff(read_track["fishread_all"]/read_track["total"])`%), of which `r mfd(read_track["fishread_without_nc"])` reads originated from the samples (`r mff(read_track["fishread_without_nc"]/read_track["fishread_all"])`%), and `r mfd(read_track["fishread_all"]-read_track["fishread_without_nc"])` reads originated from the negative control (`r mff((read_track["fishread_all"]-read_track["fishread_without_nc"])/read_track["fishread_all"])`%). Contamination accounted for a small proportion, and no further processing was performed on the negative control. Rarefaction curve based on sample reads revealed that most of the sample sequencing reads had approached the plateau phase, and `r read_track["sample_drop"]` samples with less than 15,000  reads were excluded.
+
+Calculate the proportion of non-native species
+```{r}
+
+sample_info <- fish_table %>% 
+  decostand(method="total") %>% 
+  select(any_of(filter(fish_info,non_native==TRUE)$species_ns)) %>% 
+  rowSums() %>% 
+  enframe(name="exp_id",value="non_native_ratio") %>% 
+  left_join(
+    sample_info %>% 
+      select(-any_of("non_native_ratio")),
+    by="exp_id"
+  )
+```
+
+### Figure S1
+```{r}
+#| fig-cap: "Supplementary Figure 1. Boxplot of the proportion of non-native fish species."
+#| fig-width: 4
+#| fig-height: 5
+
+figs1 <- ggplot(sample_info)+
+  geom_boxplot(aes(y=non_native_ratio))+
+  theme_bw()+
+  theme(text=element_text(family = "serif",size=15))+
+  labs(y="proportion of non-native fish")
+ggsave(
+  "./output/Figure_S1_boxplot_of_non_native.svg",
+  figs1,width = 4,height = 5,device = svglite
+)
+ggsave(
+  "./output/Figure_S1_boxplot_of_non_native.pdf",
+  figs1,width = 4,height = 5
+)
+figs1
+```
+
+A sample was found to have an extremely high proportion of non-native fish (`r mff(max(sample_info$non_native_ratio))`%), and was subsequently excluded.
+```{r}
+sample_info <- sample_info %>% 
+  filter(non_native_ratio<0.9) %>% 
+  mutate(
+    grp_nn=ntile(non_native_ratio,5),
+    grp_nn=factor(grp_nn,levels=1:5)
+  )
+fish_table <- fish_table %>% 
+  filter(rownames(.)%in%sample_info$exp_id) %>% 
+  mfc()
+read_track["final"] <- sum(fish_table)
+```
+Ultimately, `r nrow(fish_table)` samples were retained, encompassing `r ncol(fish_table)` fish taxa, and downstream analysis was conducted based on this data.
+
+Plot a reading tracking bar chart
+```{r}
+
+w01_read$figdat_read <- tibble(
+  type=c(
+    "Total","Merged","Quality filter","Zotu","Annotation","Final"
+  ),
+  read=read_track[
+    c("total","merged","filtered","zotu_read","fishread_all","final")
+  ]
+) %>% 
+  mutate(type=factor(type,levels=type))
+
+w01_read$fig_read <- ggplot(
+  w01_read$figdat_read,
+  aes(x=type,y=read)
+)+
+  geom_col(width=0.8)+
+  theme_bw()+
+  theme(
+    text=element_text(family = "serif"),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+  )+
+  labs(x=NULL,y="Reads")
+```
+
+## w02_map
+Read map and human footprint data
+```{r}
+
+w02_map <- c(hydl="hydl",hyda="hyda") %>% 
+  map(~str_c("./input/map/",.x,".shp")) %>% 
+  map(~st_read(.x,quiet=T))
+
+w02_map$hfp <- rast("./input/map/hfp2024_cropped.tif")
+```
+
+Add human footprint data to sample information
+```{r}
+sample_info <- fish_table %>% 
+  rowSums() %>% 
+  enframe(name="exp_id",value = "total_reads") %>% 
+  right_join(
+    sample_info %>% select(-any_of("total_reads")),
+    by="exp_id"
+  ) %>% 
+  mutate(
+    hfp= sample_info %>% 
+      st_as_sf(coords = c("longitude","latitude"),crs=4326) %>% 
+      st_transform(crs=32651) %>% 
+      st_buffer(dist=1000) %>% 
+      st_transform(crs = crs(w02_map$hfp)) %>% 
+      vect() %>% 
+      {terra::extract(w02_map$hfp,.,fun=mean,na.rm=T)} %>% 
+      pull(hfp2024)
+  )
+```
+
+Plot a map of the survey area
+```{r}
+w02_map$hfp2 <- w02_map$hfp %>% 
+  project("EPSG:32651",method="bilinear") %>% 
+  crop(st_transform(w02_map$hyda, 32651))
+
+w02_map$china <- st_read(
+  "./input/map/china_prov.geojson",
+  quiet=T
+) %>% 
+  st_transform(crs=4326) %>% 
+  st_make_valid() %>% 
+  st_union()
+  
+
+w02_map$fig_mini_map <- ggplot()+
+  geom_sf(
+    data=rnaturalearth::ne_countries(
+      scale = 50, returnclass = "sf"
+    ) %>%
+      filter(
+        str_detect(admin,"Philippines|Korea|Japan")
+      ) %>%
+      st_union() %>%
+      st_make_valid(),
+    size=0.25,fill=NA
+  )+
+  geom_sf(
+    data=w02_map$china, fill=NA, size=0.25,shape=NA
+  )+
+  geom_point(
+    aes(
+      x=mean(sample_info$longitude),
+      y=mean(sample_info$latitude)
+    ),
+    shape=22, size=3, col="red",fill=NA
+  )+
+  coord_sf(xlim=c(109,137),ylim=c(18,40),expand = F)+
+  theme_void()+
+  theme(
+    panel.border = element_rect(color = "black"),
+    panel.background = element_rect(fill = "lightgrey")
+  )
+  
+w02_map$figdat_site <- sample_info %>% 
+  group_by(site,habitat,longitude,latitude) %>% 
+  summarise(
+    non_native_ratio=mean(non_native_ratio),
+    .groups = "drop"
+  ) %>% 
+  st_as_sf(coords = c("longitude","latitude"),crs=4326)
+
+w02_map$fig_map <- ggplot()+
+  geom_spatraster(
+    data = w02_map$hfp2, aes(fill = hfp2024)
+  )+
+  scale_fill_gradientn(
+    colors = c("white", "blue"),
+    na.value = "transparent",
+    name = "Human Footprint"
+  )+
+  geom_sf(
+    data=w02_map$hydl,
+    color="lightblue"
+  )+
+  geom_sf(
+    data=w02_map$hyda,
+    fill="lightblue",
+    color=NA
+  )+
+  new_scale_fill()+
+  geom_sf(
+    data=w02_map$figdat_site,
+    aes(
+      fill=non_native_ratio,
+      shape=habitat
+    ),
+    size=3,col="black"
+  )+
+  scale_shape_manual(
+    values = c("river" = 21, "reservoir" = 24, "tidal" = 22)
+  )+
+  scale_fill_gradient(
+    low = "green", high = "red",
+    name="proportion of\nnon-native fish"
+  )+
+  coord_sf(
+    expand = F,crs=32651,ylim=c(3065247.5,3101061.2)
+  )+
+  labs(x=NULL,y=NULL,shape="Habitat type")+
+  annotation_north_arrow(
+    location = "tr",
+    which_north = "true",
+    style = north_arrow_minimal()
+  )+
+  annotation_scale(
+    location = "br",
+    width_hint = 0.3
+  )+
+  theme_minimal()+
+  theme(
+    axis.text.y = element_text(angle = 90,hjust = 0.5, vjust = 0.5),
+    axis.ticks = element_line(color = "black"),
+    panel.border = element_rect(
+      fill = NA, 
+      color = "black",
+      linewidth = 1
+    ),
+    text = element_text(family = "serif"),
+    panel.background = element_rect(fill = "white"),
+    legend.justification = "left",
+    legend.spacing = unit(-0.1, "cm"),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.5, "cm")
+  )+
+  inset_element(
+    w02_map$fig_mini_map,
+    left = 0.01,
+    bottom = 0.55,
+    right = 0.25,
+    top = 0.98,
+    align_to = "panel"
+  )
+
+```
+
+## w03_pca_env
+Principal component analysis of environmental factors
+```{r}
+w03_pca_env <- list()
+
+w03_pca_env$pca <- sample_info %>% 
+  select(exp_id,hfp,wt,ph,do,salinity,turbidity) %>% 
+  column_to_rownames("exp_id") %>% 
+  rda(scale=T)
+
+w03_pca_env$smry <- w03_pca_env$pca %>% summary()
+w03_pca_env$score <- map(
+  0:2,
+  function(i){
+    scores(w03_pca_env$pca,scaling=i,tidy=T) %>% 
+      split(~score) %>% 
+      modify_at(
+        "sites",
+        ~left_join(
+          .,
+          select(sample_info,exp_id,habitat,season),
+          by = join_by(label==exp_id)
+        )
+      )
+  }
+) %>% 
+  set_names(str_c("scaling",0:2))
+
+w03_pca_env <- c(
+  w03_pca_env[1:3],
+  map(
+    0:2,
+    function(i){
+      sc <- str_c("scaling",i)
+      ggplot()+
+        geom_point(
+          data=w03_pca_env$score[[sc]]$sites,
+          aes(x=PC1,y=PC2,shape=habitat,fill=season),
+          size=2,alpha=0.5,col="black"
+        )+
+        scale_shape_manual(
+          values = c("river" = 21, "reservoir" = 24, "tidal" = 22)
+        )+
+        geom_segment(
+          data=w03_pca_env$score[[sc]]$species,
+          aes(x=0,y=0,xend=PC1,yend=PC2),
+          arrow = arrow(length = unit(0.03, "npc")), 
+          alpha = 0.5
+        )+
+        geom_text(
+          data=w03_pca_env$score[[sc]]$species,
+          aes(
+            x=PC1,y=PC2,hjust = "inward", vjust = "outward",
+            label = case_when(
+              label == "hfp" ~ "Human footprint",
+              label == "do" ~ "Do",
+              label == "longitude" ~ "Longitude",
+              label == "ph" ~ "pH",
+              label == "turbidity" ~ "Turbidity",
+              label == "wt" ~ "Water temperature",
+              label == "salinity" ~ "Salinity",
+              .default = label
+            )
+          ),
+          family="serif"
+        )+
+        labs(
+          x = paste0(
+            "PC1(",
+            mff(w03_pca_env$smry$cont[[1]][2,1]),
+            "%)"
+          ),
+          y = paste0(
+            "PC2(",
+            mff(w03_pca_env$smry$cont[[1]][2,2]),
+            "%)"
+          ),
+          shape="Habitat",
+          fill="Season"
+        )+
+        guides(
+          fill = guide_legend(
+            override.aes = list(shape = 21, color = "black", size = 2)
+          )
+        )+
+        theme_bw()+
+        theme(
+          text=element_text(family = "serif"),
+          legend.position = c(0.99, 0.01),
+          legend.justification = c("right", "bottom"),
+          legend.spacing = unit(-0.2, "cm"),
+          legend.key.height = unit(0.3, "cm"),
+          legend.key.width = unit(0.3, "cm")
+        )
+    }
+  ) %>% 
+    set_names(str_c("fig_scaling",0:2))
+)
+```
+
+### Figure 1
+```{r}
+#| fig-cap: "Figure 1"
+#| fig-width: 10
+#| fig-height: 10
+
+fig1 <- w02_map$fig_map/(
+  w03_pca_env$fig_scaling2+
+    (w01_read$fig_read/w01_read$fig)+
+    plot_layout(widths = c(2, 1))
+)+
+  plot_annotation(
+    tag_levels = list(c("A", "","B", "C", "D"))
+  )
+ggsave(
+  "output/Figure_1_map.svg",
+  fig1,width = 10, height = 10,device = svglite
+)
+ggsave(
+  "output/Figure_1_map.pdf",
+  fig1,width = 10, height = 10
+)
+
+fig1
+```
+
+## w04_tree
+Construct a phylogenetic tree of fish
+```{r}
+#| output: false
+
+w04_tree <- list()
+
+w04_tree$syn <- tibble(
+  x = c(
+    "Planiliza haematocheilus",
+    "Planiliza lauvergnii",
+    "Coptodon zillii",
+    "Odontobutis potamophilus",
+    "Misgurnus dabryanus",
+    "Tachysurus dumerili"
+  ),
+  y = c(
+    "Mugil soiuy",
+    "Liza affinis",
+    "Tilapia zillii",
+    "Odontobutis potamophila",
+    "Paramisgurnus dabryanus",
+    "Leiocassis longirostris"
+  )
+)
+
+w04_tree$tree <- fish_info %>% 
+  mutate(
+    species_lt = mf_change_str(species_lt,w04_tree$syn,2)
+  ) %>% 
+  pull(species_lt) %>% 
+  sp_list_df(taxon = "fish") %>% 
+  get_tree(
+    taxon = "fish",
+    scenario = "at_basal_node",
+    show_grafted = T
+  ) %>% 
+  modify_at("tip.label",~str_replace(.x,"_"," ")) %>% 
+  modify_at("tip.label",~mf_change_str(.x,w04_tree$syn,1))
+
+w04_tree$tree_without_stars <- w04_tree$tree %>% 
+  rm_stars() %>% 
+  modify_at("tip.label",~str_replace(.x," ","_"))
+
+w04_tree$tree_dis <- w04_tree$tree_without_stars %>% 
+  cophenetic()
+
+w04_tree$node_order <- fish_info %>% 
+  group_by(order) %>% 
+  summarise(
+    sp_n=n(),
+    node=ifelse(
+      n()>1,
+      getMRCA(w04_tree$tree_without_stars,species_ns),
+      which(w04_tree$tree_without_stars$tip.label == species_ns)
+    )
+  )
+
+w04_tree$node_sp <- w04_tree$tree_without_stars$tip.label %>% 
+  as_tibble_col("species_ns") %>% 
+  mutate(
+    node=row_number()
+  ) %>% 
+  left_join(
+    fish_info %>% select(species_ns,non_native),
+    by="species_ns"
+  ) %>% 
+  select(!species_ns)
+
+w04_tree$dat_tree <- ggtree(w04_tree$tree)$data %>% 
+  as_tibble()
+
+w04_tree$fish_lvl <- w04_tree$dat_tree %>% 
+  select(label,y,isTip) %>% 
+  filter(isTip==T) %>% 
+  mutate(label=str_remove_all(label,"\\*")) %>% 
+  arrange(y)
+```
+
+## w05_domi
+Calculate and plot dominance
+```{r}
+
+w05_domi <- fish_table %>% 
+  decostand(method="total") %>% 
+  mf_cal_domi() %>% 
+  mutate(species=str_replace(species,"_"," ")) %>% 
+  left_join(
+    select(fish_info,species_lt,non_native),
+    by=join_by(species==species_lt)
+  ) %>% 
+  arrange(-domi) %>% 
+  list(domi_all=.)
+
+w05_domi$fig_domi_all_v <- w05_domi$domi_all %>% 
+  mutate(
+    species=factor(species,levels=w04_tree$fish_lvl$label)
+  ) %>% 
+  ggplot(aes(x=domi,y=species,fill=!non_native))+
+  geom_col()+
+  scale_fill_discrete(
+    labels = c("FALSE"="non-native","TRUE"="native")
+  )+
+  theme_bw()+
+  theme(
+    axis.text.y = element_blank(),
+    legend.title = element_blank(),
+    text=element_text(size=12,family="serif"),
+    legend.position = "inside",
+    legend.position.inside = c(0.90, 0.01),
+    legend.justification = c("right","bottom"),
+    legend.background = element_rect(
+      linetype = "dashed", color = "black", fill = "white"
+    )
+  )+
+  xlab("Dominance")+
+  ylab(NULL)
+```
+
+### Figure S2
+Calculate and plot dominance by season
+```{r}
+#| fig-cap: "Supplementary Figure 2. Dominance of fish species in different seasons."
+#| fig-width: 15
+#| fig-height: 10
+
+w05_domi$domi_season <- sample_info %>% 
+  split(~season) %>% 
+  map(~fish_table %>% filter(rownames(.) %in% .x$exp_id)) %>% 
+  map(~decostand(.x,method="total")) %>% 
+  map(~mf_cal_domi(.x)) %>% 
+  map(
+    ~mutate(
+      .x,
+      species=str_replace(species,"_"," ")
+    )
+  ) %>% 
+  list_rbind(names_to = "season") %>% 
+  left_join(
+    select(fish_info,species_lt,non_native),
+    by=join_by(species==species_lt)
+  ) %>% 
+  bind_rows(
+    w05_domi$domi_all %>% mutate(season="All")
+  ) %>% 
+  mutate(
+    season=factor(
+      season,levels=c("All","Spring","Summer","Autumn","Winter")
+    ),
+    species=factor(species,levels=w05_domi$domi_all$species)
+  )
+
+figs2 <- ggplot(
+  w05_domi$domi_season,
+  aes(x=species,y=domi,fill=!non_native)
+)+
+  facet_grid(season~.)+
+  geom_col()+
+  scale_fill_discrete(labels = c("FALSE"="non-native","TRUE"="native"))+
+  theme_bw()+
+  theme(
+    axis.text.x = element_text(
+      angle = 90, 
+      vjust = 0.5, 
+      hjust = 1,
+      family = "serif",
+      face = "italic"
+    ),
+    legend.title = element_blank(),
+    text=element_text(size=15,family="serif")
+  )+
+  xlab(NULL)+
+  ylab("Dominance")
+
+
+ggsave(
+  "./output/Figure_S2_domi_season.svg",
+  figs2,
+  width = 15,height = 10,device = svglite
+)
+ggsave(
+  "./output/Figure_S2_domi_season.pdf",
+  figs2,
+  width = 15,height = 10
+)
+
+figs2
+```
+
+## w06_distribution
+Distribution of non-native fish species
+```{r}
+w06_distribution <- list()
+
+w06_distribution$mod_base <- gam(
+  data=sample_info,
+  non_native_ratio~s(ph)+
+    s(do)+
+    te(longitude,latitude)+
+    habitat+
+    season+
+    salinity+
+    turbidity+
+    log(filtration_volume)+
+    s(site,bs="re"),
+  weights=total_reads,
+  family=quasibinomial(link = "logit"),
+  method="REML",
+  select = T
+)
+
+w06_distribution$mod_full <- gam(
+  data=sample_info,
+  non_native_ratio~s(hfp)+
+    s(ph)+
+    s(do)+
+    te(longitude,latitude)+
+    habitat+
+    season+
+    salinity+
+    turbidity+
+    log(filtration_volume)+
+    s(site,bs="re"),
+  weights=total_reads,
+  family=quasibinomial(link = "logit"),
+  method="REML",
+  select = T
+)
+
+anova(
+  w06_distribution$mod_base, 
+  w06_distribution$mod_full, 
+  test="F"
+)
+
+w06_distribution$smry_tab_p <- w06_distribution$mod_full %>% 
+  summary() %>% 
+  .[["p.table"]] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Terms")
+
+w06_distribution$smry_tab_s <- w06_distribution$mod_full %>% 
+  summary() %>% 
+  .[["s.table"]] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Terms") %>% 
+  mutate(
+    p_lab=case_when(
+      `p-value`<0.001 ~ "p < 0.001***",
+      `p-value`<0.01  ~ sprintf("p = %.3f**",`p-value`),
+      `p-value`<0.05  ~ sprintf("p = %.3f*", `p-value`),
+      .default = sprintf("p = %.3f", `p-value`)
+    )
+  )
+
+w06_distribution$dat_fit <- tibble(
+  hfp=seq(min(sample_info$hfp),max(sample_info$hfp),length=100),
+  ph=seq(min(sample_info$ph),max(sample_info$ph),length=100),
+  do=0,
+  habitat="river",
+  season="Summer",
+  longitude=0,
+  latitude=0,
+  salinity=0,
+  turbidity=0,
+  filtration_volume=0,
+  site=as.factor("1"),
+  total_reads=0
+) %>% 
+  bind_cols(
+    predict(
+      w06_distribution$mod_full,
+      newdata=.,
+      type="terms",
+      terms=c("s(hfp)","s(ph)"),
+      se.fit=T
+    ) %>% 
+      as.data.frame() %>% 
+      rename_with(~{
+        .x %>% 
+          str_replace("^fit\\.s\\.","fit_") %>% 
+          str_replace("^se\\.fit\\.s\\.","se_") %>% 
+          str_remove_all("\\.")
+      })
+  ) %>% 
+  pivot_longer(
+    cols = c(fit_hfp, fit_ph, se_hfp, se_ph),
+    names_to = c(".value", "terms"),
+    names_pattern = "(fit|se)_(.*)"
+  ) %>% 
+  mutate(
+    x = case_when(
+      terms == "hfp" ~ hfp,
+      terms == "ph"  ~ ph
+    )
+  )
+
+w06_distribution$dat_resi <- sample_info %>% 
+  mutate(resi=residuals(w06_distribution$mod_full,type="working")) %>% 
+  bind_cols(
+    predict(
+      w06_distribution$mod_full,
+      newdata=.,
+      type="terms",
+      terms=c("s(hfp)","s(ph)"),
+      se.fit=T
+    ) %>% 
+      as.data.frame() %>% 
+      rename_with(~{
+        .x %>% 
+          str_replace("^fit\\.s\\.","fit_") %>% 
+          str_replace("^se\\.fit\\.s\\.","se_") %>% 
+          str_remove_all("\\.")
+      })
+  ) %>% 
+  pivot_longer(
+    cols = c(fit_hfp, fit_ph, se_hfp, se_ph),
+    names_to = c(".value", "terms"),
+    names_pattern = "(fit|se)_(.*)"
+  ) %>% 
+  mutate(
+    x = case_when(
+      terms == "hfp" ~ hfp,
+      terms == "ph"  ~ ph
+    ),
+    fit_resi=fit+resi
+  )
+
+w06_distribution$fig_fit <- ggplot(w06_distribution$dat_fit)+
+  facet_wrap(
+    terms~.,
+    ncol=1,scale="free",
+    labeller = labeller(
+      terms=c(
+        hfp = "Human Footprint",
+        ph  = "pH"
+      )
+    )
+  )+
+  geom_line(aes(x=x,y=fit),linewidth=0.75,col="blue")+
+  geom_ribbon(
+    aes(x=x,ymin=fit-1.96*se,ymax=fit+1.96*se),
+    alpha=0.25
+  )+
+  geom_point(
+    data=w06_distribution$dat_resi %>% filter(fit_resi<=4),
+    aes(x=x,y=fit_resi),
+    alpha=0.5
+  )+
+  geom_text(
+    data=w06_distribution$smry_tab_s %>% 
+      filter(Terms %in% c("s(hfp)","s(ph)")) %>% 
+      mutate(terms=str_extract(Terms,"\\((.+)\\)",1)),
+    aes(x=-Inf,y=Inf,label = p_lab),
+    hjust=-0.1,vjust=1.5,
+    family="serif",size=5
+  )+
+  labs(
+    x=NULL,
+    y="Partial effect on proportion of non-native fish species (logit)"
+  )+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=15)
+  )
+
+w06_distribution$figdat_boxplot <- sample_info %>% 
+  mutate(
+    resi=residuals(w06_distribution$mod_full,type="working")
+  ) %>% 
+  bind_cols(
+    predict(
+      w06_distribution$mod_full,
+      newdata=.,
+      type="terms",
+      terms=c("habitat","season"),
+      se.fit=T
+    ) %>% 
+      as.data.frame() %>% 
+      rename_with(~{
+        .x %>% 
+          str_replace("^fit\\.","fit_") %>% 
+          str_replace("^se\\.fit\\.","se_")
+      })
+  ) %>% 
+  pivot_longer(
+    cols = c(fit_habitat,fit_season,se_habitat,se_season),
+    names_to = c(".value", "terms"),
+    names_pattern = "(fit|se)_(.*)"
+  ) %>% 
+  mutate(
+    x = case_when(
+      terms == "habitat" ~ habitat,
+      terms == "season"  ~ season
+    ),
+    fit_resi=fit+resi,
+    terms=factor(terms,levels=c("season","habitat"))
+  )
+
+w06_distribution$figdat_cld <- c(
+  season="season",
+  habitat="habitat"
+) %>% 
+  map(
+    ~emmeans::emmeans(
+      w06_distribution$mod_full, 
+      reformulate(.x),
+      data=sample_info
+    )
+  ) %>% 
+  map(pairs) %>% 
+  map(summary) %>% 
+  map(
+    ~set_names(.x$p.value,str_replace_all(.x$contrast," ",""))
+  ) %>% 
+  map(multcompView::multcompLetters) %>% 
+  map("Letters") %>% 
+  map(~enframe(.x,name="x",value="cld")) %>% 
+  list_rbind(names_to="terms") %>% 
+  left_join(
+    w06_distribution$figdat_boxplot %>% 
+      summarise(y=1.1*max(fit_resi),.by=terms),
+    by="terms"
+  ) %>% 
+  mutate(
+    terms=factor(terms,levels=c("season","habitat")),
+  )
+
+w06_distribution$fig_boxplot <- ggplot(w06_distribution$figdat_boxplot)+
+  facet_wrap(
+    ~terms,ncol=1,scales="free",
+    labeller=labeller(
+      terms=c(
+        season="Season",
+        habitat="Habitat"
+      )
+    )
+  )+
+  geom_boxplot(aes(x=x,y=fit_resi))+
+  geom_text(
+    data=w06_distribution$figdat_cld,
+    aes(x=x,y=y,label=cld),
+    family="serif",size=5
+  )+
+  scale_x_discrete(labels = function(x) str_to_sentence(x))+
+  labs(
+    x=NULL,
+    y="Partial effect on proportion of non-native fish species (logit)"
+  )+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=15)
+  )
+```
+### Figure 3
+```{r}
+#| fig-cap: "Figure 3"
+#| fig-width: 10
+#| fig-height: 8
+
+fig3 <- w06_distribution$fig_fit+
+  w06_distribution$fig_boxplot+
+  plot_layout(widths = c(1.5, 1))+
+  plot_annotation(tag_levels = list(c("A", "B")))
+  
+ggsave(
+  "./output/Figure_3_distribution.svg",
+  fig3,
+  width = 10,height = 8,device = svglite
+)
+ggsave(
+  "./output/Figure_3_distribution.pdf",
+  fig3,
+  width = 10,height = 8
+)
+
+fig3
+```
+To ensure the legibility of the figures, eight points with values > 4 were removed during the visualization process in fig3a.
+
+### Figure S3
+```{r}
+#| fig-cap: "Supplementary Figure 3. Diagnostic checks of the GAM for non-native fish distribution."
+#| fig-width: 8
+#| fig-height: 7
+
+w06_distribution$resi <- tibble(
+  resi = residuals(w06_distribution$mod_full,type="deviance"),
+  ftvl = w06_distribution$mod_full$fitted.values,
+  resp = w06_distribution$mod_full$y
+)
+
+w06_distribution$fig_qt <- ggplot(
+  w06_distribution$resi,
+  aes(sample=resi)
+)+
+  geom_qq(shape=1,alpha=0.25)+
+  geom_qq_line()+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text.x = element_text(face="italic")
+  )+
+  labs(x="Theoretical Quantiles",y="Sample Quantiles")
+
+w06_distribution$fig_hs <- ggplot(
+  w06_distribution$resi,
+  aes(x=resi)
+)+
+  geom_histogram(
+    stat='bin',
+    bins = 12,
+    col='black',
+    alpha=0.4,
+    position = "identity"
+  )+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text.x = element_text(face="italic")
+  )+
+  labs(x="Residuals",y="Frequency")
+
+w06_distribution$fig_fresi <- ggplot(
+  w06_distribution$resi,
+  aes(x=ftvl,y=resi)
+)+
+  geom_point(alpha=0.25)+
+  geom_hline(yintercept = 0,linetype=2)+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text.x = element_text(face="italic")
+  )+
+  labs(x="Fitted values",y="Residuals")
+
+w06_distribution$fig_fresp <- ggplot(
+  w06_distribution$resi,
+  aes(x=ftvl,y=resp)
+)+
+  geom_point(alpha=0.25)+
+  geom_abline(slope=1,linetype=2)+
+  coord_cartesian(clip = "on")+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text.x = element_text(face="italic")
+  )+
+  labs(x="Fitted values",y="Response")
+
+figs3 <- (w06_distribution$fig_qt + w06_distribution$fig_hs)/
+  (w06_distribution$fig_fresi + w06_distribution$fig_fresp)+
+  plot_layout(guides = "collect")
+ggsave(
+  "./output/Figure_S3_distribution_gam_resi.svg",
+  figs3,
+  width = 8,height = 7,device = svglite
+)
+ggsave(
+  "./output/Figure_S3_distribution_gam_resi.pdf",
+  figs3,
+  width = 8,height = 7
+)
+
+figs3
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S01
+```{r}
+#| tbl-cap: "Supplementary Table 1. Parametric coefficient estimates of the GAM for non-native fish distribution."
+
+tabs01 <- w06_distribution$smry_tab_p %>% 
+  gt()
+tabs01
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S02
+```{r}
+#| tbl-cap: "Supplementary Table 2. Smooth term tests of the GAM for non-native fish distribution."
+
+tabs02 <- w06_distribution$smry_tab_s %>% 
+  select(-p_lab) %>% 
+  gt()
+tabs02
+```
+
+```{=latex}
+\clearpage
+```
+
+Diagnosis of GAMs
+```{r}
+#| results: hide
+#| fig-show: hide
+
+w06_distribution$check <- w06_distribution$mod_full %>% 
+  gam.check() %>% 
+  capture.output() %>% 
+  .[13:17] %>% 
+  str_split("\\s+") %>% 
+  do.call(rbind,.) %>% 
+  .[,-6] %>% 
+  as_tibble(
+    .name_repair=~c("term","k'","edf","k-index","p-value")
+  ) %>% 
+  mutate(
+    across(everything(),~na_if(.,"NA")),
+    `p-value` = case_when(
+      `p-value`<=0.001 ~ str_c(`p-value`,"***"),
+      `p-value`<=0.01 ~ str_c(`p-value`,"**"),
+      `p-value`<=0.05 ~ str_c(`p-value`,"*"),
+      .default = `p-value`
+    )
+  )
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S03
+```{r}
+#| tbl-cap: "Supplementary Table 3. Diagnostic checks of the GAM for non-native fish distribution."
+
+tabs03 <- w06_distribution$check %>% 
+  gt() %>% 
+  sub_missing(missing_text = "")
+tabs03
+```
+
+```{=latex}
+\clearpage
+```
+
+## w07_src
+Area-Intensity separated species rarefaction surface (AISRS)
+
+Stability of parameter estimation under subsamples with different sample sizes
+```{r}
+#| eval: false
+
+w07_src <- list()
+
+w07_src$fish_mat <- fish_table %>% 
+  decostand("pa") %>% 
+  as.matrix()
+
+w07_src$sample_coord <- sample_info %>% 
+  st_as_sf(coords = c("longitude","latitude"),crs=4326) %>% 
+  st_transform(crs=32651) %>% 
+  st_coordinates()
+
+set.seed(202602)
+plan(multisession, workers = availableCores() - 1)
+w07_src$dat_cv <- future_map(
+  seq_len(100),
+  function(k){
+    sub_idx <- mf_get_idx(
+          w07_src$sample_coord,
+          sub_rep = 2000,
+          seed=k
+        )
+    dat_sub <- mf_cal_area(
+          w07_src$sample_coord,
+          sub_idx,
+          buf = 1000
+        ) %>% 
+          mutate(
+            sp=mf_cal_sp(w07_src$fish_mat,sub_idx)
+          ) %>% 
+      group_by(sample_n)
+    map(
+      c(
+        10,20,40,60,80,
+        100,150,200,250,300,350,400,450,
+        500,750,1000,1500,2000
+      ),
+      function(i){
+        
+        dat_sub_i <- dat_sub %>% 
+          slice_head(n=i)
+        
+        mod_nls <- tryCatch(
+          nlsLM(
+            data=dat_sub_i,
+            sp~a*sample_area^b*intensity^c/(d^c+intensity^c),
+            start=list(a=15,b=0.28,c=0.6,d=0.007)
+          ),
+          error = function(e){NULL},
+          warning = function(w){NULL}
+        )
+        
+        if(is.null(mod_nls)){
+          return(c(a=NA,b=NA,c=NA,d=NA,sub_rep=i))
+        }else{
+          return(c(coef(mod_nls),sub_rep=i))
+        }
+      }
+    ) %>% 
+      bind_rows()
+  },
+  .options = furrr_options(seed = TRUE)
+) %>% 
+  list_rbind() %>% 
+  filter(!is.na(a)) %>% 
+  group_by(sub_rep) %>% 
+  summarise(
+    across(c(a,b,c,d),~sd(.x)/mean(.x)),
+    mod_rep=n()
+  )
+plan(sequential)
+
+w07_src$fig_cv <- w07_src$dat_cv %>% 
+  pivot_longer(
+    a:d,
+    names_to = "para",
+    values_to = "cv"
+  ) %>% 
+  ggplot(aes(x=sub_rep,y=cv,col=para))+
+  geom_line()+
+  geom_point()+
+  geom_hline(yintercept = 0.01,col="red",linetype=2)+
+  annotate(
+    "text", 
+    x = Inf, y = 0.01, 
+    label = "1.0%",
+    col = "red", size=5,family="serif",
+    hjust = 1.05, vjust = -0.5
+  )+
+  labs(
+    x="Subsampling times",
+    y="Coefficient of Variation",
+    col=NULL
+  )+
+  theme_bw()+
+  theme(
+    text = element_text(size=15,family="serif"),
+    legend.position = "inside",
+    legend.position.inside = c(0.98, 0.98),
+    legend.justification = c("right","top")
+  )
+```
+
+Point estimation
+```{r}
+#| eval: false
+
+set.seed(202603)
+
+w07_src$est_point$idx <- mf_get_idx(
+  w07_src$sample_coord,
+  sub_rep = 2000,
+  seed=202603
+)
+
+w07_src$est_point$dat_orig_sub <- mf_cal_area(
+  w07_src$sample_coord,
+  w07_src$est_point$idx
+) %>% 
+  mutate(
+    sp=mf_cal_sp(w07_src$fish_mat,w07_src$est_point$idx)
+  )
+
+w07_src$est_point$mod_nls <- w07_src$est_point$dat_orig_sub %>% 
+  nlsLM(
+    data=.,
+    sp~a*sample_area^b*intensity^c/(d^c+intensity^c),
+    start=list(a=15,b=0.28,c=0.6,d=0.007)
+  )
+
+w07_src$est_point$para <- w07_src$est_point$mod_nls %>% coef()
+
+w07_src$est_point$dat_orig_sub <- w07_src$est_point$dat_orig_sub %>% 
+  mutate(
+    fit=fitted(w07_src$est_point$mod_nls),
+    resi=residuals(w07_src$est_point$mod_nls)
+  )
+```
+
+Point estimation. Prediction-observation, and residual diagnostics
+```{r}
+#| eval: false
+
+w07_src$est_point$fig_resi_hist <- w07_src$est_point$dat_orig_sub %>% 
+  select(resi) %>% 
+  ggplot()+
+  geom_histogram(
+    aes(x=resi),
+    binwidth = 0.5,
+    col="black",
+    fill="grey",
+    alpha=0.5
+  )+
+  xlim(-20,20)+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=15)
+  )+
+  labs(y="Count")
+  
+
+w07_src$est_point$fig_fit_obs <- w07_src$est_point$dat_orig_sub %>% 
+  select(fit,sp) %>% 
+  ggplot(aes(x = fit, y = sp))+
+  geom_hex(bins = 50)+
+  scale_fill_viridis_c(
+    trans = "log10",
+    breaks = c(10, 100, 1000, 10000),
+    labels = c("10", "100", "1000","10000")
+  )+
+  geom_abline(color = "red", linewidth = 0.8)+
+  coord_cartesian(clip = "on")+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=15),
+    legend.position = "inside",
+    legend.position.inside = c(0.98,0.02),
+    legend.justification.inside = c(1, 0),
+    legend.key.size = unit(3, "mm")
+  )+
+  labs(
+    x="Fitted richness",
+    y="Richness",
+    fill = "Count"
+  )
+
+w07_src$est_point$fig_fit_resi <- w07_src$est_point$dat_orig_sub %>% 
+  select(fit,resi) %>% 
+  ggplot(aes(x = fit, y = resi))+
+  geom_hex(bins = 50)+
+  scale_fill_viridis_c(
+    trans = "log10",
+    breaks = c(10, 100, 1000, 10000),
+    labels = c("10", "100", "1000","10000")
+  )+
+  geom_hline(yintercept = 0,color = "red", linewidth = 0.8)+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=15),
+    legend.position = "inside",
+    legend.position.inside = c(0.98,0.98),
+    legend.justification.inside = c(1, 1),
+    legend.key.size = unit(3, "mm")
+  )+
+  labs(
+    x="Fitted richness",
+    y="Residuals",
+    fill = "Count"
+  )
+```
+
+Interval estimation
+```{r}
+#| eval: false
+
+w07_src$est_interval$fish_pi <- mf_sp_pi(
+  colSums(w07_src$fish_mat),
+  nrow(w07_src$fish_mat),
+  w07_src$est_point$para[["a"]]*
+    max(w07_src[["est_point"]][["dat_orig_sub"]]$sample_area)^
+    w07_src$est_point$para[["b"]]-
+    ncol(w07_src$fish_mat)
+)
+
+w07_src$est_interval$fish_site_weight <- w07_src$fish_mat %>%
+  as_tibble() %>%
+  map(
+    function(i){
+      df <- tibble(y = i, w07_src$sample_coord %>% as_tibble())
+      gam(
+        data=df,
+        y~te(X,Y),
+        family=binomial,
+        method="REML"
+      ) %>%
+        fitted()
+    }
+  ) %>%
+  bind_cols()
+
+set.seed(202604)
+plan(multisession, workers = availableCores() - 1L)
+w07_src$est_interval$para <- future_map(
+  seq_len(2222L),
+  function(i){
+    n_sample <- nrow(w07_src$fish_mat)
+    n_fish_obs <- ncol(w07_src$fish_mat)
+    n_fish <- length(w07_src$est_interval$fish_pi)
+
+    obs_boot <- rbinom(n_fish,n_sample,w07_src$est_interval$fish_pi)
+    
+    fish_mat_boot <- matrix(0L,n_sample,n_fish)
+    for(j in seq_len(n_fish)){
+      idx <- sample.int(
+        n_sample,
+        obs_boot[j],
+        replace = F,
+        prob = if(j<=n_fish_obs){
+          w07_src$est_interval$fish_site_weight %>% 
+            as_tibble %>% 
+            pull(j)
+        }else{
+          w07_src$est_interval$fish_site_weight %>% 
+            as_tibble %>% 
+            pull(sample(n_fish_obs,1))
+        }
+      )
+      fish_mat_boot[idx, j] <- 1L
+    }
+
+    dat_boot_sub <- w07_src$est_point$dat_orig_sub %>% 
+      mutate(
+        sp=mf_cal_sp(fish_mat_boot,w07_src$est_point$idx)
+      )
+    
+    mod_nls_boot <- tryCatch(
+      nlsLM(
+        data=dat_boot_sub,
+        sp~a*sample_area^b*intensity^c/(d^c+intensity^c),
+        start=list(a=15,b=0.28,c=0.6,d=0.007)
+      ),
+      error = function(e){NULL},
+      warning = function(w){NULL}
+    )
+    
+    if(is.null(mod_nls_boot)){
+      return(c(a=NA,b=NA,c=NA,d=NA))
+    }else{
+      return(coef(mod_nls_boot))
+    }
+  },
+  .options = furrr_options(seed = TRUE)
+) %>% 
+  bind_rows()
+plan(sequential)
+
+saveRDS(
+  w07_src,
+  "./mid/w07_src.rds"
+)
+```
+
+
+```{r}
+#| output: false
+
+w07_src <- readRDS("./mid/w07_src.rds")
+
+a <- w07_src[["est_point"]][["para"]][["a"]]
+b <- w07_src[["est_point"]][["para"]][["b"]]
+c <- w07_src[["est_point"]][["para"]][["c"]]
+d <- w07_src[["est_point"]][["para"]][["d"]]
+max_area <- w07_src$est_point$dat_orig_sub$sample_area %>% 
+  max()
+
+w07_src[["est_interval"]][["para"]] %>% 
+  drop_na() %>% 
+  rename_with(~ str_c(.x,"_itvl")) %>% 
+  as.list() %>%
+  list2env(envir = .GlobalEnv)
+```
+
+
+The model is shown as follows:
+
+$$
+S = `r round(a,3)` \cdot Area^{`r round(b,3)`} \cdot \frac{Intensity^{`r round(c,3)`}}{`r round(d,4)`^{`r round(c,3)`} + Intensity^{`r round(c,3)`}}
+$$
+
+
+Parameter interval
+
+The nls fit was successful in `r mff(length(a_itvl)/2222)`% of the 2222 bootstrap runs.
+```{r}
+w07_src[["est_interval"]][["para"]] %>% 
+  drop_na() %>% 
+  map(~quantile(.x,c(0.025,0.5,0.975))) %>% 
+  bind_rows(.id = "Parameter") %>% 
+  mutate(`Point estimation`=c(a,b,c,d),.before = `2.5%`) %>% 
+  gt() %>% 
+  fmt_number(decimals = 4)
+
+w07_src[["est_interval"]][["para"]] %>% 
+    drop_na() %>% 
+    imap(
+        ~mf_bc_ci(.x,get(.y)) %>% 
+          set_names(c("lw","up"))
+    ) %>% 
+  bind_rows(.id = "Parameter") %>% 
+  mutate(`Point estimation`=c(a,b,c,d),.before = 2) %>% 
+  gt() %>% 
+  fmt_number(decimals = 4)
+```
+
+```{r}
+w07_src$est_interval$fig_para_pair <- w07_src$est_interval$para %>% 
+  drop_na() %>% 
+  GGally::ggpairs(
+    data=.,
+    upper = list(
+      continuous = GGally::wrap(
+        "cor", 
+        method = "spearman",
+        title = "Spearman cor",
+        size = 4,
+        family="serif"
+      )
+    ),
+    lower = list(
+      continuous = GGally::wrap(
+        "points", 
+        alpha = 0.2, 
+        size = 0.5
+      )
+    ),
+    diag  = list(
+      continuous = GGally::wrap(
+        "barDiag", 
+        bins = 30,
+        fill = "grey", 
+        linewidth=0.1,
+        color = "black"
+      )
+    )
+  )+
+  theme(
+    text=element_text(family="serif")
+  )
+
+```
+
+
+Sample-based rarefaction curve (SBRC)
+```{r}
+w07_src$dat_src <- iNEXT::iNEXT(
+  list(fish_table %>% decostand("pa") %>% t()),
+  q=0,
+  datatype = "incidence_raw",
+  size=1:(nrow(fish_table)*3)
+) %>% 
+  fortify() %>% 
+  select(
+    sample=x,
+    richness=y,
+    lw=y.lwr,
+    up=y.upr,
+  ) %>% 
+  mutate(
+    type="SBRC"
+  )
+```
+
+Spatial sample-based rarefaction curves (sSBRC)
+```{r}
+w07_src$dat_src<-mobr::rarefaction(
+  w07_src$fish_mat,
+  coords=w07_src$sample_coord,
+  method="sSBR",
+  latlong = F
+) %>% 
+  enframe(name="sample",value="richness") %>% 
+  mutate(
+    sample=as.numeric(sample),
+    type="sSBRC"
+  ) %>% 
+  bind_rows(w07_src$dat_src %>% filter(type!="sSBRC"))
+```
+
+Calculate sample-based rarefaction curves by AISRS
+```{r}
+w07_src$dat_src <- w07_src[["est_point"]][["dat_orig_sub"]] %>% 
+  summarise(
+    sample_area=mean(sample_area),
+    .by=sample_n
+  ) %>% 
+  bind_rows(
+    tibble(
+      sample_n=(nrow(fish_table)+1):(nrow(fish_table)*3),
+      sample_area=max_area
+    )
+  ) %>% 
+  mutate(
+    intensity=sample_n/sample_area,
+    richness=a*sample_area^b*intensity^c/(d^c+intensity^c)
+  ) %>% 
+  rowwise() %>% 
+  mutate(
+    lw=mf_bc_ci(
+      a_itvl*sample_area^b_itvl*
+        intensity^c_itvl/(d_itvl^c_itvl+intensity^c_itvl),
+      richness,
+      0.025
+    ),
+    up=mf_bc_ci(
+      a_itvl*sample_area^b_itvl*
+        intensity^c_itvl/(d_itvl^c_itvl+intensity^c_itvl),
+      richness,
+      0.975
+    ),
+    type="AISRS"
+  ) %>% 
+  ungroup() %>% 
+  rename(sample=sample_n) %>% 
+  select(!c(sample_area,intensity)) %>% 
+  bind_rows(w07_src$dat_src %>% filter(type!="AISRS"))
+```
+
+Plot three types of rarefaction curves
+```{r}
+w07_src$fig_src <- w07_src$dat_src %>% 
+  ggplot()+
+  geom_line(
+    aes(
+      x=sample,
+      y=richness,
+      col=type,
+      linetype=sample>nrow(sample_info)
+    )
+  )+
+  scale_linetype_manual(
+    values = c("FALSE" = 1, "TRUE" = 2),
+    name   = NULL,
+    labels = c(
+      "FALSE" = "Samples",
+      "TRUE"  = "Extrapolation"
+    )
+  )+
+  geom_ribbon(
+    aes(
+      x=sample,
+      ymin=lw,
+      ymax=up,
+      fill=type
+    ),
+    alpha=0.15,
+    na.rm = T
+  )+
+  theme_bw()+
+  theme(
+    text = element_text(family="serif",size=12),
+    legend.title = element_blank(),
+    legend.position = "inside",
+    legend.position.inside = c(0.98,0.02),
+    legend.justification.inside = c(1, 0),
+    legend.spacing = unit(-0.2, "cm")
+  )+
+  labs(x="Samples",y="Richness")
+```
+
+AISRS vs SBRC
+```{r}
+w07_src$fig_aisrs_sbrc <- w07_src$dat_src %>% 
+  filter(type!="sSBRC") %>% 
+  select(!c(lw,up)) %>% 
+  pivot_wider(
+    names_from = type,values_from = richness
+  ) %>% 
+  ggplot()+
+  geom_point(
+    aes(x=SBRC,y=AISRS,col=sample>nrow(sample_info)),
+    shape=1
+  )+
+  scale_color_discrete(
+    name   = NULL,
+    labels = c(
+      "FALSE" = "Samples",
+      "TRUE"  = "Extrapolation"
+    )
+  )+
+  geom_abline()+
+  theme_bw()+
+  theme(
+    text = element_text(family="serif",size=12),
+    legend.title = element_blank(),
+    legend.position = "inside",
+    legend.position.inside = c(0.98,0.02),
+    legend.justification.inside = c(1, 0)
+  )
+```
+
+Estimate the extrapolated species richness
+```{r}
+w07_src$sp_pool <- fish_table %>% 
+  decostand("pa") %>% 
+  specpool() %>% 
+  as_tibble() %>% 
+  select(-n) %>% 
+  pivot_longer(
+    cols = -Species,
+    names_to = c("index", "stat"),
+    names_pattern = "^(.*?)\\.?(se)?$"
+  ) %>%
+  mutate(stat = if_else(stat=="","est",stat)) %>%
+  pivot_wider(names_from = stat, values_from = value) %>% 
+  mutate(
+    D   = est - Species,
+    R   = exp(1.96 * sqrt(log(1 + se^2 / D^2))),
+    ll  = Species + D / R,
+    ul  = Species + D * R,
+    lab = sprintf("%.1f (%.1f - %.1f)",est,ll,ul)
+  ) %>% 
+  select(-c(D,R,ll,ul))
+```
+
+Species area relationship (SAR) calculated by AISRS
+```{r}
+w07_src$dat_ref <- tibble(
+  area=max_area,
+  sp=w07_src$sp_pool$est,
+  region="Research area"
+) %>% 
+  bind_rows(
+    read_csv(
+      "./input/ref_region_fish.csv",
+      show_col_types = F
+    )
+  )
+
+w07_src$dat_sar <- tibble(
+  area=c(10^seq(0,7,length=100),unique(w07_src$dat_ref$area)),
+) %>% 
+  rowwise() %>% 
+  mutate(
+    fit_poit=a*area^b,
+    lw=mf_bc_ci(
+      a_itvl*area^b_itvl,
+      fit_poit,
+      0.025
+    ),
+    up=mf_bc_ci(
+      a_itvl*area^b_itvl,
+      fit_poit,
+      0.975
+    )
+  ) %>% 
+  ungroup()
+
+w07_src$fig_sar <- ggplot()+
+  geom_line(
+    data=w07_src$dat_sar,
+    aes(x=area,y=fit_poit,linetype=area>max_area)
+  )+
+  scale_linetype_manual(
+    values = c("FALSE" = 1, "TRUE" = 2),
+    name   = NULL,
+    labels = c(
+      "FALSE" = "Samples",
+      "TRUE"  = "Extrapolation"
+    )
+  )+
+  geom_ribbon(
+    data=w07_src$dat_sar,
+    aes(
+      x=area,
+      ymin=lw,
+      ymax=up
+    ),
+    alpha=0.15
+  )+
+  geom_point(
+    data=w07_src$dat_ref,
+    aes(x=area,y=sp),
+    size=2
+  )+
+  geom_text_repel(
+    data=w07_src$dat_ref %>% slice_max(sp,by=region),
+    aes(x=area,y=sp,label=region),
+    size=3,family="serif"
+  )+
+  scale_x_log10()+
+  scale_y_log10()+
+  labs(x=expression(Area ~ (km^2)),y="Richness")+
+  theme_bw()+
+  theme(
+    text = element_text(family="serif",size=12),
+    legend.position = "inside",
+    legend.position.inside = c(0.98,0.02),
+    legend.justification.inside = c(1, 0)
+  )
+```
+
+```{r}
+#| results: asis
+
+sprintf(
+  "The Chao index of the current research area is %s, the first order jackknife is %s, and the second order jackknife is %.1f, the bootstrap estimate is %s. Based on AISRS, the estimated number of fish species is %.1f (%.1f - %.1f), and 96 species were actually detected. The survey saturation rate is %.1f%% (%.1f%% - %.1f%%).\n\n",
+  w07_src$sp_pool %>% filter(index=="chao") %>% pull(lab),
+  w07_src$sp_pool %>% filter(index=="jack1") %>% pull(lab),
+  w07_src$sp_pool %>% filter(index=="jack2") %>% pull(est),
+  w07_src$sp_pool %>% filter(index=="boot") %>% pull(lab),
+  w07_src$dat_sar[[101,2]],
+  w07_src$dat_sar[[101,3]],
+  w07_src$dat_sar[[101,4]],
+  (175/max_area)^c/(d^c+(175/max_area)^c)*100,
+  mf_bc_ci(
+    (175/max_area)^c_itvl/(d_itvl^c_itvl+(175/max_area)^c_itvl),
+    (175/max_area)^c/(d^c+(175/max_area)^c),
+    0.025
+  )*100,
+  mf_bc_ci(
+    (175/max_area)^c_itvl/(d_itvl^c_itvl+(175/max_area)^c_itvl),
+    (175/max_area)^c/(d^c+(175/max_area)^c),
+    0.975
+  )*100
+) %>% cat()
+
+sprintf(
+  "The number of non-native fish species not discovered during the survey is approximately %.1f (%.1f - %.1f).\n\n",
+  a*max_area^b*(
+    1-(175/max_area)^c/(d^c+(175/max_area)^c)
+  )*sum(fish_info$non_native)/nrow(fish_info),
+  mf_bc_ci(
+    a_itvl*max_area^b_itvl*(
+      1-(175/max_area)^c_itvl/(d_itvl^c_itvl+(175/max_area)^c_itvl)
+    )*sum(fish_info$non_native)/nrow(fish_info),
+    a*max_area^b*(
+      1-(175/max_area)^c/(d^c+(175/max_area)^c)
+    )*sum(fish_info$non_native)/nrow(fish_info),
+    0.025
+  ),
+  mf_bc_ci(
+    a_itvl*max_area^b_itvl*(
+      1-(175/max_area)^c_itvl/(d_itvl^c_itvl+(175/max_area)^c_itvl)
+    )*sum(fish_info$non_native)/nrow(fish_info),
+    a*max_area^b*(
+      1-(175/max_area)^c/(d^c+(175/max_area)^c)
+    )*sum(fish_info$non_native)/nrow(fish_info),
+    0.975
+  )
+) %>% cat()
+
+sprintf(
+  "The number of freshwater fish species in Zhejiang Province is approximately  %.0f, and based on AISRS, it is estimated to be approximately %.1f (%.1f - %.1f).\n\n",
+  w07_src$dat_ref %>% 
+    filter(region=="Zhejiang province") %>% 
+    pull(sp),
+  w07_src$dat_sar %>% filter(area==105500) %>% pull(2),
+  w07_src$dat_sar %>% filter(area==105500) %>% pull(3),
+  w07_src$dat_sar %>% filter(area==105500) %>% pull(4)
+) %>% cat()
+
+sprintf(
+  "The number of freshwater fish species in China is approximately %s, and based on AISRS, it is estimated to be approximately %.1f (%.1f - %.1f).\n\n",
+  w07_src$dat_ref %>% 
+    filter(region=="China") %>% 
+    pull(sp) %>% 
+    range %>% 
+    str_c(collapse = " - "),
+  w07_src$dat_sar %>% filter(area==9600000) %>% pull(2),
+  w07_src$dat_sar %>% filter(area==9600000) %>% pull(3),
+  w07_src$dat_sar %>% filter(area==9600000) %>% pull(4)
+) %>% cat()
+
+```
+
+Calculate the sampling intensity required to reach a specific detection threshold using AISRS.
+```{r}
+w07_src$dat_intensity <- tibble(
+  intensity=seq(0,2,length=1000),
+) %>% 
+  rowwise() %>% 
+  mutate(
+    fit_poit=intensity^c/(d^c+intensity^c),
+    lw=mf_bc_ci(
+      intensity^c_itvl/(d_itvl^c_itvl+intensity^c_itvl),
+      fit_poit,
+      0.025
+    ),
+    up=mf_bc_ci(
+      intensity^c_itvl/(d_itvl^c_itvl+intensity^c_itvl),
+      fit_poit,
+      0.975
+    )
+  ) %>% 
+  ungroup()
+
+w07_src$dat_threshold <- tibble(
+  threshold=c(0.50,0.85,0.90,0.95),
+  intensity=d*(threshold/(1-threshold))^(1/c),
+  lab=sprintf("(%.3f, %.0f%%)",intensity,threshold*100)
+) %>% 
+  rowwise() %>% 
+  mutate(
+    lw=mf_bc_ci(
+      d_itvl*(threshold/(1-threshold))^(1/c_itvl),
+      intensity,
+      0.025
+    ),
+    up=mf_bc_ci(
+      d_itvl*(threshold/(1-threshold))^(1/c_itvl),
+      intensity,
+      0.975
+    )
+  ) %>% 
+  ungroup()
+
+w07_src$fig_intensity <- ggplot()+
+  geom_line(
+    data=w07_src$dat_intensity,
+    aes(
+      x=intensity,
+      y=fit_poit,
+      linetype = intensity > nrow(sample_info)/max_area
+    )
+  )+
+  scale_linetype_manual(
+    values = c("FALSE" = 1, "TRUE" = 2),
+    name   = NULL,
+    labels = c(
+      "FALSE" = "Samples",
+      "TRUE"  = "Extrapolation"
+    )
+  )+
+  geom_ribbon(
+    data=w07_src$dat_intensity,
+    aes(
+      x=intensity,
+      ymin=lw,
+      ymax=up
+    ),
+    alpha=0.15
+  )+
+  geom_point(
+    data=w07_src$dat_threshold,
+    aes(x=intensity,y=threshold),
+    size=2
+  )+
+  geom_text_repel(
+    data=w07_src$dat_threshold,
+    aes(x=intensity,y=threshold,label=lab),
+    size=3
+  )+
+  xlim(0,filter(w07_src$dat_threshold,threshold==0.95)$intensity * 1.1)+
+  labs(
+    x=expression(Sampling~intensity ~ (samples/km^2)),
+    y="Detection rate"
+  )+
+  scale_y_continuous(labels = scales::percent)+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=12),
+    legend.position = "inside",
+    legend.position.inside = c(0.98,0.02),
+    legend.justification.inside = c(1, 0)
+  )
+
+```
+
+
+```{r}
+#| results: asis
+
+do.call(
+  sprintf, 
+  c(
+    "The survey intensities required to achieve survey saturation rates of 50%%, 85%%, 90%%, and 95%% are: %.1f (%.1f - %.1f), %.1f (%.1f - %.1f), %.1f (%.1f - %.1f), %.1f (%.1f - %.1f) samples per 100 km^2", 
+    w07_src[["dat_threshold"]] %>%
+      {select(.,intensity, lw, up)*100} %>%
+      transpose() %>%
+      flatten()
+  )
+) %>% cat()
+```
+
+Plot the 3D surface of the AISRS
+```{r}
+#| results: hide
+#| fig-show: hide
+#| output: false
+
+w07_src$dat_fitted_3d <- expand.grid(
+  area=seq(
+    3.14,
+    max_area*1.1,
+    length=200
+  ),
+  intensity=c(
+    seq(
+      min(w07_src$est_point$dat_orig_sub$intensity),
+      filter(w07_src$dat_threshold,threshold==0.95)$intensity * 1.1,
+      length=199
+    ),
+    filter(w07_src$dat_threshold,threshold==0.95)$intensity
+  ) %>% sort()
+) %>% 
+  mutate(fit=a*area^b*intensity^c/(d^c+intensity^c))
+
+w07_src$plotly_fit_3d <- plot_ly() %>% 
+  add_surface(
+    x=w07_src$dat_fitted_3d$area %>% unique,
+    y=w07_src$dat_fitted_3d$intensity %>% unique,
+    z=w07_src$dat_fitted_3d$fit %>% 
+      matrix(
+        nrow=length(unique(w07_src$dat_fitted_3d$intensity)),
+        byrow = T
+      ),
+    colorscale = "Viridis",
+    opacity=1,
+    showscale=F,
+    contours = list(
+      x = list(
+        show = TRUE,
+        color="white",
+        start = min(w07_src$dat_fitted_3d$area),
+        end = max(w07_src$dat_fitted_3d$area),
+        size = diff(range(w07_src$dat_fitted_3d$area))/25
+      ),
+      y = list(
+        show = TRUE,
+        color="white",
+        start = min(w07_src$dat_fitted_3d$intensity),
+        end = max(w07_src$dat_fitted_3d$intensity),
+        size = diff(range(w07_src$dat_fitted_3d$intensity))/25
+      )
+    )
+  ) %>% 
+  add_trace(
+    data = w07_src$dat_fitted_3d %>% 
+      filter(
+        intensity==filter(
+          w07_src$dat_threshold,
+          threshold==0.95
+        )$intensity
+      ),
+    x = ~area,
+    y = ~intensity,
+    z = ~fit,
+    type = "scatter3d",
+    mode = "lines",
+    line = list(color = "red", width = 5),
+    showlegend = F
+  ) %>%
+  plotly::layout(
+    scene = list(
+      xaxis = list(
+        title = "Survey area (km<sup>2</sup>)",
+        titlefont = list(size = 28),
+        tickfont = list(size = 16)
+        # showline = T
+      ),
+      yaxis = list(
+        title = "Sampling intensity (samples/km<sup>2</sup>)",
+        titlefont = list(size = 28),
+        tickfont = list(size = 16)
+      ),
+      zaxis = list(
+        title = "Richness",
+        titlefont = list(size = 28),
+        tickfont = list(size = 16)
+      ),
+      camera=list(
+        eye=list(x=-1.25,y=-1.25,z=1.25),
+        center=list(x=0,y=0,z=-0.2)
+      )
+    ),
+    font = list(family = "serif"),
+    title = NULL
+  )
+htmlwidgets::saveWidget(
+  w07_src$plotly_fit_3d, 
+  "./mid/Figure_AISRS.html", selfcontained = TRUE
+)
+Sys.setenv(
+  CHROMOTE_CHROME="C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+)
+w07_src$fig_path <- webshot2::webshot(
+  "./mid/Figure_AISRS.html", 
+  file = "./mid/Figure_AISRS.png", 
+  vwidth = 1400, vheight = 1400, zoom = 1.5,
+  quiet=T
+)
+chromote::default_chromote_object()$get_browser()$close()
+w07_src$fig_3d <- magick::image_read("./mid/Figure_AISRS.png") %>% 
+  magick::image_trim(fuzz=0) %>%
+  magick::image_ggplot(interpolate = T)+
+  theme(
+    text=element_text(family="serif",size=12),
+    plot.margin = margin(0, 0, 0, 0, "in")
+  )
+```
+
+```{r}
+
+w07_src$plotly_fit_3d
+```
+
+
+The distribution of bootstrap values.
+Expected species richness obtained by surveying with existing samling intensity in the current study area.
+```{r}
+w07_src$figdat_dis_sp <- tibble(
+  x=a*max_area^b*(nrow(sample_info)/max_area)^c/
+    (d^c+(nrow(sample_info)/max_area)^c),
+  type="point"
+) %>% 
+  bind_rows(
+   tibble(
+     x=a_itvl*max_area^b_itvl*(nrow(sample_info)/max_area)^c_itvl/
+       (d_itvl^c_itvl+(nrow(sample_info)/max_area)^c_itvl),
+     type="itvl"
+   )
+  )
+w07_src$fig_dis_sp <- ggplot()+
+  geom_histogram(
+    data=w07_src$figdat_dis_sp %>% filter(type=="itvl"),
+    aes(x=x),
+    bins = 20,
+    fill="grey",
+    col="black",
+    alpha=0.2
+  )+
+  geom_vline(
+    data=w07_src$figdat_dis_sp %>% filter(type=="point"),
+    aes(xintercept=x),
+    col="red",
+    linetype=2
+  )+
+  labs(x="Expected species richness")+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=12)
+  )
+```
+
+Expected extrapolated species richness in the current study area
+```{r}
+w07_src$figdat_dis_extra_sp <- tibble(
+  x=a*max_area^b,
+  type="point"
+) %>% 
+  bind_rows(
+    tibble(
+      x=a_itvl*max_area^b_itvl,
+      type="itvl"
+    )
+  )
+w07_src$fig_dis_extra_sp <- ggplot()+
+  geom_histogram(
+    data=w07_src$figdat_dis_extra_sp %>% filter(type=="itvl"),
+    aes(x=x),
+    bins = 20,
+    fill="grey",
+    col="black",
+    alpha=0.2
+  )+
+  geom_vline(
+    data=w07_src$figdat_dis_extra_sp %>% filter(type=="point"),
+    aes(xintercept=x),
+    col="red",
+    linetype=2
+  )+
+  labs(x="Expected extrapolated species richness")+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=12)
+  )
+```
+
+Expected survey saturation with existing samling intensity in the current study area
+```{r}
+w07_src$figdat_dis_satu <- tibble(
+  x=(nrow(sample_info)/max_area)^c/
+    (d^c+(nrow(sample_info)/max_area)^c),
+  type="point"
+) %>% 
+  bind_rows(
+    tibble(
+      x=(nrow(sample_info)/max_area)^c_itvl/
+        (d_itvl^c_itvl+(nrow(sample_info)/max_area)^c_itvl),
+      type="itvl"
+    )
+  )
+w07_src$fig_dis_satu <- ggplot()+
+  geom_histogram(
+    data=w07_src$figdat_dis_satu %>% filter(type=="itvl"),
+    aes(x=x),
+    bins = 20,
+    fill="grey",
+    col="black",
+    alpha=0.2
+  )+
+  geom_vline(
+    data=w07_src$figdat_dis_satu %>% filter(type=="point"),
+    aes(xintercept=x),
+    col="red",
+    linetype=2
+  )+
+  labs(x="Expected survey saturation")+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=12)
+  )
+```
+
+Expected sampling intensity under different levels of survey saturation
+```{r}
+w07_src$figdat_dis_inte <- c(0.5,0.85,0.9,0.95) %>% 
+  map(
+    ~tibble(
+      fit=d*(.x/(1-.x))^(1/c),
+      saturation=str_c("saturation=",.x),
+      type="point"
+    ) %>% 
+      bind_rows(
+        tibble(
+          fit=d_itvl*(.x/(1-.x))^(1/c_itvl),
+          saturation=str_c("saturation=",.x),
+          type="itvl"
+        )
+      )
+  ) %>% 
+  list_rbind()
+
+w07_src$fig_dis_inte <- 
+  ggplot()+
+  geom_histogram(
+    data=w07_src$figdat_dis_inte %>% filter(type=="itvl"),
+    aes(
+      x=fit,col=saturation,fill=saturation
+    ),
+    bins = 20,
+    alpha=0.2
+  )+
+  geom_vline(
+    data=w07_src$figdat_dis_inte %>% filter(type=="point"),
+    aes(
+      xintercept=fit
+    ),
+    col="red",
+    linetype=2
+  )+
+  facet_wrap(.~saturation,scale="free",ncol=1)+
+  scale_x_log10()+
+  labs(x="Expected sampling intensity (samples/km^2)")+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=12),
+    legend.position = "none"
+  )
+
+```
+
+Expected undetected non-native fish species
+```{r}
+w07_src$figdat_dis_undetected_exotic <- tibble(
+  x=a*max_area^b*(
+    1-(175/max_area)^c/(d^c+(175/max_area)^c)
+  )*sum(fish_info$non_native)/nrow(fish_info),
+  type="point"
+) %>% 
+  bind_rows(
+    tibble(
+      x=a_itvl*max_area^b_itvl*(
+        1-(175/max_area)^c_itvl/(d_itvl^c_itvl+(175/max_area)^c_itvl)
+      )*sum(fish_info$non_native)/nrow(fish_info),
+      type="itvl"
+    )
+  )
+w07_src$fig_dis_undetected_exotic <- ggplot()+
+  geom_histogram(
+    data=w07_src$figdat_dis_undetected_exotic %>% filter(type=="itvl"),
+    aes(x=x),
+    bins = 20,
+    fill="grey",
+    col="black",
+    alpha=0.2
+  )+
+  geom_vline(
+    data=w07_src$figdat_dis_undetected_exotic %>% filter(type=="point"),
+    aes(xintercept=x),
+    col="red",
+    linetype=2
+  )+
+  labs(x="Expected undetected non-native fish species")+
+  theme_bw()+
+  theme(
+    text=element_text(family="serif",size=12)
+  )
+```
+
+
+### Figure 4
+```{r}
+#| warning: false
+#| fig-cap: "Figure 4"
+#| fig-width: 14
+#| fig-height: 7
+
+fig4 <- w07_src$fig_3d+
+  (w07_src$fig_src+w07_src$fig_aisrs_sbrc)/
+  (w07_src$fig_sar+w07_src$fig_intensity)+
+  plot_annotation(tag_levels = list(c("A", "B", "C", "D", "E")))
+
+ggsave(
+  "./output/Figure_4_rarefaction.svg",
+  fig4,
+  width = 14,height = 7,device = svglite
+)
+ggsave(
+  "./output/Figure_4_rarefaction.pdf",
+  fig4,
+  width = 14,height = 7
+)
+
+fig4
+```
+
+### Figure S4
+```{r}
+#| fig-cap: "Supplementary Figure 4. Variance coefficient of subsampling times and diagnostics for the nonlinear least squares (NLS) model."
+#| fig-width: 15
+#| fig-height: 10
+#| warning: false
+
+figs4 <- w07_src$fig_cv+(
+  w07_src$est_point$fig_resi_hist/
+    w07_src$est_point$fig_fit_obs/
+    w07_src$est_point$fig_fit_resi
+)+plot_layout(widths = c(1,0.5))+
+  plot_annotation(tag_levels = list(c("A", "B", "C", "D")))
+
+ggsave(
+  "./output/Figure_S4_nls_check.svg",
+  figs4,
+  width = 15,height = 10,device = svglite
+)
+ggsave(
+  "./output/Figure_S4_nls_check.pdf",
+  figs4,
+  width = 15,height = 10
+)
+
+figs4
+```
+
+### Figure S5
+```{r}
+#| fig-cap: "Supplementary Figure 5. Bootstrap parameter pairwise correlation matrix."
+#| fig-width: 10
+#| fig-height: 8
+
+figs5 <- w07_src$est_interval$fig_para_pair
+
+ggsave(
+  "./output/Figure_S5_boot_para_pairwise.svg",
+  figs5,
+  width = 10,height = 8,device = svglite
+)
+ggsave(
+  "./output/Figure_S5_boot_para_pairwise.pdf",
+  figs5,
+  width = 10,height = 8
+)
+
+figs5
+```
+
+### Figure S6
+```{r}
+#| fig-cap: "Supplementary Figure 6. The distribution of derived variables."
+#| fig-width: 9
+#| fig-height: 12
+
+figs6 <- ((w07_src$fig_dis_sp/
+  w07_src$fig_dis_extra_sp/
+  w07_src$fig_dis_satu/
+  w07_src$fig_dis_undetected_exotic) | 
+  w07_src$fig_dis_inte)+
+  plot_annotation(tag_levels = list(c("A", "B", "C", "D","E")))
+
+ggsave(
+  "./output/Figure_S6_boot_derived_variables.svg",
+  figs6,
+  width = 9,height = 12,device = svglite
+)
+ggsave(
+  "./output/Figure_S6_boot_derived_variables.pdf",
+  figs6,
+  width = 9,height = 12
+)
+
+figs6
+```
+
+
+## w08_alpha
+The five diversity indices, *S* (Species abundance), *H* (Shannon diversity), *J* (Evenness), *MPD* (Mean pairwise distance), and *MNTD* (Mean nearest taxon distance), were calculated on the datasets that included all fish species (All) and those that only contained native fish species (Native).
+```{r}
+#| eval: false
+
+set.seed(202605)
+w08_alpha <- list()
+w08_alpha$alpha_div <- list(
+  All=fish_table,
+  Native=fish_table %>% 
+    select(
+      any_of(
+        filter(fish_info,non_native==FALSE)$species_ns
+      )
+    )
+) %>% 
+  map(~decostand(.x,method="total")) %>% 
+  map(
+    ~tibble(
+      exp_id=rownames(.x),
+      S=specnumber(.x),
+      H=diversity(.x,index="shannon"),
+      J=H/log(S),
+      MPD=ses.mpd(
+        .x,w04_tree$tree_dis,abundance.weighted=T
+      )$mpd.obs.z,
+      MNTD=ses.mntd(
+        .x,w04_tree$tree_dis,abundance.weighted=T
+      )$mntd.obs.z
+    )
+  ) %>% 
+  list_rbind(names_to = "sp_range") %>% 
+  pivot_longer(
+    cols=S:MNTD,
+    names_to="index",
+    values_to = "values"
+  ) %>% 
+  mutate(
+    index=factor(
+      index,levels=c("S","H","J","MPD","MNTD")
+    ),
+    sp_range=factor(sp_range,levels=c("All","Native"))
+  ) %>% 
+  arrange(index,sp_range) %>% 
+  left_join(sample_info %>% select(-type),by="exp_id")
+```
+
+On the All and Native datasets, GAMs were established respectively using five diversity indicators as response variables.
+```{r}
+#| eval: false
+
+w08_alpha$families <- list(
+  S    = nb(link = "log"),
+  H    = Gamma(link = "log"),
+  J    = betar(link = "logit"),
+  MPD  = gaussian(link = "identity"),
+  MNTD = gaussian(link = "identity")
+)
+
+w08_alpha$gam <- w08_alpha$alpha_div %>% 
+  split(~sp_range+index) %>% 
+  imap(
+    ~gam(
+      data = .x,
+      family = w08_alpha$families[[str_extract(
+        .y, "(S|H|J|MPD|MNTD)$"
+      )]],
+      formula = values~s(non_native_ratio)+
+        s(hfp)+
+        s(ph)+
+        s(do)+
+        te(longitude,latitude)+
+        habitat+
+        season+
+        salinity+
+        turbidity+
+        log(filtration_volume)+
+        log(total_reads)+
+        s(site,bs="re"),
+      method = "REML",
+      select = T
+    )
+  )
+
+saveRDS(
+  w08_alpha,
+  "./mid/w08_alpha.rds"
+)
+```
+
+Prepare the data for drawing.
+```{r}
+#| results: hide
+#| fig-show: hide
+
+w08_alpha <- readRDS("./mid/w08_alpha.rds")
+
+w08_alpha$ptresi <- w08_alpha$gam %>% 
+  imap(
+    function(i,j){
+      f_plotgam <- plot.gam(i,select = 0,residuals = T,se=1.96)
+      f_fit <- tibble(
+        x = f_plotgam[[1]]$x,
+        y = f_plotgam[[1]]$fit[,1],
+        se = f_plotgam[[1]]$se,
+        index = str_extract(j,"\\.(.*)",1),
+        sp_range = str_extract(j,"(.*)\\.",1)
+      )
+      f_raw <- tibble(
+        x = f_plotgam[[1]]$raw,
+        y = residuals(i,type="working")+
+          predict(i,type="terms",terms="s(non_native_ratio)")[,1],
+        index = str_extract(j,"\\.(.*)",1),
+        sp_range = str_extract(j,"(.*)\\.",1)
+      )
+      f_smry_tab_p <- summary(i)[["p.table"]] %>% 
+        as.data.frame() %>% 
+        rownames_to_column("term") %>% 
+        mutate(
+          index = str_extract(j,"\\.(.*)",1),
+          sp_range = str_extract(j,"(.*)\\.",1)
+        )
+      f_smry_tab_s <- summary(i)[["s.table"]] %>% 
+        as.data.frame() %>% 
+        rownames_to_column("term") %>% 
+        mutate(
+          index = str_extract(j,"\\.(.*)",1),
+          sp_range = str_extract(j,"(.*)\\.",1)
+        )
+      return(
+        list(
+          fit=f_fit,
+          raw=f_raw,
+          smry_tab_p=f_smry_tab_p,
+          smry_tab_s=f_smry_tab_s
+        )
+      )
+    }
+  ) %>% 
+  list_transpose() %>% 
+  map(bind_rows) %>% 
+  map(
+    ~mutate(
+      .x,
+      index=factor(
+        index,
+        levels=c("S","H","J","MPD","MNTD")
+      ),
+      sp_range=factor(sp_range,levels=c("All","Native"))
+    )
+  ) %>% 
+  modify_at(
+    "smry_tab_s",
+    ~select(.x,!`p-value`,`p-value`)
+  )
+```
+
+### Figure 5
+```{r}
+#| fig-cap: "Figure 5"
+#| fig-width: 6
+#| fig-height: 12
+
+fig5 <- ggplot(
+  data=w08_alpha$ptresi$fit,
+  aes(x=x,y=y)
+)+
+  facet_grid(index~.,scales="free_y")+
+  geom_line(aes(col=sp_range))+
+  geom_ribbon(
+    aes(
+      x=x,
+      ymin=y-se,
+      ymax=y+se,
+      group=sp_range
+    ),
+    alpha=0.15
+  )+
+  geom_point(
+    data=w08_alpha$ptresi$raw %>% filter(y >= -1.5),
+    aes(x=x,y=y,col=sp_range),
+    alpha=0.65,size=0.5
+  )+
+  geom_text(
+    data=w08_alpha$ptresi$smry_tab_s %>% 
+      left_join(
+        w08_alpha$ptresi$raw %>% 
+          filter(y >= -1.5) %>% 
+          group_by(index) %>% 
+          summarise(y_max=max(y),y_diff=diff(range(y))),
+        by="index"
+      ) %>% 
+      filter(
+        term=="s(non_native_ratio)"
+      ) %>% 
+      mutate(
+        # p_lab=round(`p-value`,3),
+        p_lab=case_when(
+          `p-value`<0.001 ~ "p<0.001***",
+          `p-value`<0.01  ~ sprintf("p=%.3f**",`p-value`),
+          `p-value`<0.05  ~ sprintf("p=%.3f*", `p-value`),
+          .default = sprintf("p=%.3f", `p-value`)
+        ),
+        p_y=y_max-y_diff*0.08*(as.numeric(sp_range)-1)
+      ),
+    aes(x=0.7,y=p_y,label=p_lab,col=sp_range),
+    hjust=0,
+    show.legend = F
+  )+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text.y = element_text(face = "italic")
+  )+
+  labs(
+    x="proportion of non-native fish species",
+    y="Component smooth function"
+  )
+
+ggsave(
+  "./output/Figure_5_gam_component_smooth.svg",
+  fig5,
+  width = 6,height = 12,device = svglite
+)
+ggsave(
+  "./output/Figure_5_gam_component_smooth.pdf",
+  fig5,
+  width = 6,height = 12
+)
+
+fig5
+```
+To ensure the legibility of the figure, 22 points with values < -1.5 were removed during the visualization process in fig5.
+
+
+### Figure S7
+```{r}
+#| fig-cap: "Supplementary Figure 7. Diagnostic checks of the GAM for α diversity."
+#| fig-width: 15
+#| fig-height: 16
+
+w08_alpha$resi <- w08_alpha$gam %>% 
+  imap(
+    function(i,j){
+      f_resi <- tibble(
+        resi = residuals(i,type="deviance"),
+        ftvl = i$fitted.values,
+        resp = i$y,
+        index = str_extract(j,"\\.(.*)",1),
+        sp_range = str_extract(j,"(.*)\\.",1)
+      )
+    } 
+  ) %>% 
+  list_rbind() %>% 
+  mutate(
+    index=factor(
+      index,
+      levels=c("S","H","J","MPD","MNTD")
+    ),
+    sp_range=factor(sp_range,levels=c("All","Native"))
+  )
+
+w08_alpha$fig_qt <- ggplot(
+  w08_alpha$resi,
+  aes(sample=resi,col=sp_range)
+)+
+  facet_wrap("index",scales = "free",ncol=1)+
+  geom_qq(shape=1,alpha=0.25)+
+  geom_qq_line()+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text = element_blank(),
+    strip.background = element_blank()
+  )+
+  labs(x="Theoretical Quantiles",y="Sample Quantiles")
+
+w08_alpha$fig_hs <- ggplot(
+  w08_alpha$resi,
+  aes(x=resi,fill=sp_range)
+)+
+  facet_wrap("index",scales = "free",ncol=1)+
+  geom_histogram(
+    stat='bin',
+    bins = 12,
+    col='black',
+    alpha=0.4,
+    position = "identity"
+  )+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text = element_blank(),
+    strip.background = element_blank()
+  )+
+  labs(x="Residuals",y="Frequency")
+
+w08_alpha$fig_fresi <- ggplot(
+  w08_alpha$resi,
+  aes(x=ftvl,y=resi,col=sp_range)
+)+
+  facet_wrap("index",scales = "free",ncol=1)+
+  geom_point(alpha=0.25)+
+  geom_hline(yintercept = 0,linetype=2)+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text = element_blank(),
+    strip.background = element_blank()
+  )+
+  labs(x="Fitted values",y="Residuals")
+
+w08_alpha$fig_fresp <- ggplot(
+  w08_alpha$resi,
+  aes(x=ftvl,y=resp,col=sp_range)
+)+
+  facet_wrap(
+    "index",
+    scales = "free",
+    ncol=1,
+    strip.position = "right"
+  )+
+  geom_point(alpha=0.25)+
+  geom_abline(slope=1,linetype=2)+
+  coord_cartesian(clip = "on")+
+  theme_bw()+
+  theme(
+    text=element_text(size=15,family = "serif"),
+    legend.title = element_blank(),
+    strip.text.y = element_text(face="italic")
+  )+
+  labs(x="Fitted values",y="Response")
+
+figs7 <- w08_alpha$fig_qt+
+  w08_alpha$fig_hs+
+  w08_alpha$fig_fresi+
+  w08_alpha$fig_fresp+
+  plot_layout(guides = "collect",nrow=1)
+ggsave(
+  "./output/Figure_S7_gam_resi.svg",
+  figs7,
+  width = 15,height = 16,device = svglite
+)
+ggsave(
+  "./output/Figure_S7_gam_resi.pdf",
+  figs7,
+  width = 15,height = 16
+)
+
+figs7
+```
+
+Diagnosis of GAMs
+```{r}
+#| results: hide
+#| fig-show: hide
+
+w08_alpha$check <- w08_alpha$gam %>% 
+  imap(
+    function(i,j){
+      capture.output(gam.check(i))[13:18] %>% 
+        str_split("\\s+") %>% 
+        do.call(rbind,.) %>% .[,-6] %>% 
+        as_tibble(
+          .name_repair=~c("term","k'","edf","k-index","p-value")
+        ) %>% 
+        mutate(
+          across(everything(), ~na_if(., "NA")),
+          
+          index = str_extract(j,"\\.(.*)",1),
+          sp_range = str_extract(j,"(.*)\\.",1)
+        )
+    }
+  ) %>% 
+  list_rbind() %>% 
+  mutate(
+    `p-value` = case_when(
+      `p-value`<=0.001 ~ str_c(`p-value`,"***"),
+      `p-value`<=0.01 ~ str_c(`p-value`,"**"),
+      `p-value`<=0.05 ~ str_c(`p-value`,"*"),
+      .default = `p-value`
+    )
+  )
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S04
+```{r}
+#| tbl-cap: "Supplementary Table 4. Parametric coefficient estimates of the GAM for S."
+
+tabs04 <- w08_alpha$ptresi$smry_tab_p %>% 
+  filter(index=="S") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs04
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S05
+```{r}
+#| tbl-cap: "Supplementary Table 5. Smooth term tests of the GAM for S."
+
+tabs05 <- w08_alpha$ptresi$smry_tab_s %>% 
+  filter(index=="S") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs05
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S06
+```{r}
+#| tbl-cap: "Supplementary Table 6. Diagnostic checks of the GAM for S."
+
+tabs06 <- w08_alpha$check %>% 
+  filter(index=="S") %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs06
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S07
+```{r}
+#| tbl-cap: "Supplementary Table 7. Parametric coefficient estimates of the GAM for H."
+
+tabs07 <- w08_alpha$ptresi$smry_tab_p %>% 
+  filter(index=="H") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs07
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S08
+```{r}
+#| tbl-cap: "Supplementary Table 8. Smooth term tests of the GAM for H."
+
+tabs08 <- w08_alpha$ptresi$smry_tab_s %>% 
+  filter(index=="H") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs08
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S09
+```{r}
+#| tbl-cap: "Supplementary Table 9. Diagnostic checks of the GAM for H."
+
+tabs09<- w08_alpha$check %>% 
+  filter(index=="H") %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs09
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S10
+```{r}
+#| tbl-cap: "Supplementary Table 10. Parametric coefficient estimates of the GAM for J."
+
+tabs10 <- w08_alpha$ptresi$smry_tab_p %>% 
+  filter(index=="J") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs10
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S11
+```{r}
+#| tbl-cap: "Supplementary Table 11. Smooth term tests of the GAM for J."
+
+tabs11 <- w08_alpha$ptresi$smry_tab_s %>% 
+  filter(index=="J") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs11
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S12
+```{r}
+#| tbl-cap: "Supplementary Table 12. Diagnostic checks of the GAM for J."
+
+tabs12 <- w08_alpha$check %>% 
+  filter(index=="J") %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs12
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S13
+```{r}
+#| tbl-cap: "Supplementary Table 13. Parametric coefficient estimates of the GAM for MPD."
+
+tabs13 <- w08_alpha$ptresi$smry_tab_p %>% 
+  filter(index=="MPD") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs13
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S14
+```{r}
+#| tbl-cap: "Supplementary Table 14. Smooth term tests of the GAM for MPD."
+
+tabs14 <- w08_alpha$ptresi$smry_tab_s %>% 
+  filter(index=="MPD") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs14
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S15
+```{r}
+#| tbl-cap: "Supplementary Table 15. Diagnostic checks of the GAM for MPD."
+
+tabs15 <- w08_alpha$check %>% 
+  filter(index=="MPD") %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs15
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S16
+```{r}
+#| tbl-cap: "Supplementary Table 16. Parametric coefficient estimates of the GAM for MNTD."
+
+tabs16 <- w08_alpha$ptresi$smry_tab_p %>% 
+  filter(index=="MNTD") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs16
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S17
+```{r}
+#| tbl-cap: "Supplementary Table 17. Smooth term tests of the GAM for MNTD."
+
+tabs17 <- w08_alpha$ptresi$smry_tab_s %>% 
+  filter(index=="MNTD") %>% 
+  select(where(~ !all(is.na(.)))) %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  fmt_scientific(
+    decimals = 2
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs17
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S18
+```{r}
+#| tbl-cap: "Supplementary Table 18. Diagnostic checks of the GAM for MNTD."
+
+tabs18 <- w08_alpha$check %>% 
+  filter(index=="MNTD") %>% 
+  select(!index) %>% 
+  gt(
+    groupname_col = "sp_range",
+    row_group_as_column = T
+  ) %>% 
+  sub_missing(missing_text = "")
+tabs18
+```
+
+```{=latex}
+\clearpage
+```
+
+## w09_assem
+```{r}
+#| eval: false
+#| warning: false
+#| message: false
+#| output: false
+
+set.seed(202606)
+w09_assem <- list()
+
+w09_assem$dat <- expand.grid(
+  sp_range=c("All","Native"),
+  weight=c(T,F)
+) %>% 
+  rowwise() %>% 
+  mutate(
+    fish_table2=ifelse(
+      sp_range=="All",
+      list(fish_table %>% decostand("total")),
+      list(
+        fish_table %>% 
+          select(
+            any_of(
+              filter(fish_info,non_native==FALSE)$species_ns
+            )
+          ) %>% 
+          mfc() %>% 
+          decostand("total")
+      )
+    ),
+    tree_dis=list(
+      w04_tree$tree_without_stars %>% 
+        keep.tip(colnames(fish_table2)) %>% 
+        cophenetic()
+    ),
+    assem=list(
+      list(
+        bNRI = bNRIn.p(
+          comm = fish_table2,
+          dis = tree_dis,
+          weighted = weight,
+          rand = 999,
+          nworker = 4,
+          sig.index = "SES",
+          output.bMPD = T
+        ),
+        bNTI = bNTIn.p(
+          comm = fish_table2,
+          dis = tree_dis,
+          weighted = weight,
+          rand = 999,
+          nworker = 4,
+          sig.index = "SES",
+          output.bMNTD = T
+        ),
+        RCbray = RC.pc(
+          comm = fish_table2,
+          rand = 999,
+          nworker = 4,
+          weighted = weight,
+          sig.index = "RC",
+          output.bray = T
+        )
+      )
+    )
+  ) %>% 
+  select(-c(fish_table2,tree_dis)) %>% 
+  unnest_longer(assem,indices_to = "index") %>% 
+  unnest_longer(assem,indices_to = "type",values_to = "dis") %>% 
+  filter(type!="sig.index") %>% 
+  mutate(
+    type=ifelse(type=="index","ses","obs")
+  )
+```
+
+MRM
+```{r}
+#| eval: false
+
+w09_assem$var <- list(
+  non_native_ratio_dis=dist(sample_info$non_native_ratio),
+  geo_dis=dist(sample_info %>% select(longitude,latitude)),
+  env_dis=sample_info %>% 
+    select(hfp,ph,do,salinity,turbidity,habitat,season) %>% 
+    cluster::daisy(metric = "gower"),
+  exp_dis=sample_info %>% 
+    select(filtration_volume,total_reads) %>% 
+    mutate(across(everything(),~log(.))) %>% 
+    dist()
+) %>% 
+  c(
+    sample_info %>% 
+      select(
+        non_native_ratio,hfp,longitude,latitude,ph,do,
+        salinity,turbidity,wt,filtration_volume,total_reads
+      ) %>% 
+      mutate(
+        filtration_volume=log(filtration_volume),
+        total_reads=log(total_reads)
+      ) %>% 
+      map(~as.dist(outer(.x,.x,`+`)/2)) %>% 
+      set_names(~str_c(.x,"_mean"))
+  )
+
+w09_assem$dat <- w09_assem$dat %>% 
+  rowwise() %>% 
+  mutate(
+    mrm=list(
+      MRM(
+        data=c(list(y=as.dist(dis)),w09_assem$var),
+        y~non_native_ratio_dis+
+          env_dis+
+          geo_dis+
+          exp_dis+
+          non_native_ratio_mean+
+          hfp_mean+
+          ph_mean+
+          do_mean+
+          salinity_mean+
+          turbidity_mean+
+          wt_mean+
+          longitude_mean+
+          latitude_mean+
+          filtration_volume_mean+
+          total_reads_mean
+      )
+    )
+  )
+
+saveRDS(
+  w09_assem,
+  "./mid/w09_assem.rds"
+)
+```
+
+figdat_βNRI,βNTI,RCbray
+```{r}
+
+w09_assem <- readRDS("./mid/w09_assem.rds")
+
+w09_assem$grp_nn_lab <- sample_info %>% 
+  group_by(grp_nn) %>% 
+  summarise(
+    label=sprintf(
+      "%.1f~%.1f%%",
+      min(non_native_ratio)*100,
+      max(non_native_ratio)*100
+    )
+  ) %>% 
+  pull(label)
+
+w09_assem$figdat_ass <- w09_assem$dat %>% 
+  rowwise() %>% 
+  filter(type!="obs") %>%
+  mutate(
+    dis3col=list(dis %>% dist.3col())
+  ) %>% 
+  ungroup() %>% 
+  select(-c(dis,mrm)) %>% 
+  unnest(dis3col) %>% 
+  left_join(
+    sample_info %>% select(exp_id,grp_nn),
+    by=join_by(name1==exp_id)
+  ) %>% 
+  left_join(
+    sample_info %>% select(exp_id,grp_nn),
+    by=join_by(name2==exp_id),
+    suffix = c("","2")
+  ) %>% 
+  nest(figdata=!weight)
+
+w09_assem$fig_density <- w09_assem$figdat_ass %>% 
+  rowwise() %>% 
+  mutate(
+    fig=list(
+      ggplot(figdata)+
+        facet_grid(
+          index~.,scale="free",switch = "y",
+          labeller = labeller(
+            index = c(
+              bNRI = "βNRI",
+              bNTI = "βNTI",
+              RCbray = "RCbray"
+            )
+          )
+        )+
+        geom_density(
+          aes(x=after_stat(scaled),y=dis,fill=sp_range),
+          alpha=0.5,linewidth=0.25
+        )+
+        geom_hline(
+          data=tibble(
+            index=c(
+              "bNRI","bNRI","bNTI","bNTI","RCbray","RCbray"
+            ),
+            yinter=c(1.96,-1.96,1.96,-1.96,0.95,-0.95)
+          ),
+          aes(yintercept = yinter),
+          linetype=2,
+          linewidth=0.25,
+          color="red"
+        )+
+        geom_blank(
+          data=figdata %>% 
+            group_by(index) %>% 
+            filter(dis==max(dis)|dis==min(dis)) %>% 
+            ungroup(),
+          aes(x=1,y=dis)
+        )+
+        scale_x_reverse(breaks = c(0,0.5,1))+
+        theme_bw()+
+        theme(
+          text=element_text(family="serif",size=16),
+          legend.title = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank()
+        )+
+        labs(
+          x="Scaled density",
+          y=NULL,
+          title = ifelse(
+            weight,
+            "A. Relative abundance weighting",
+            "C. Unweighted"
+          )
+        )
+    )
+  ) %>% 
+  select(weight,fig)
+
+w09_assem$fig_boxplot <- w09_assem$figdat_ass %>% 
+  rowwise() %>% 
+  mutate(
+    fig=list(
+      ggplot(figdata %>% filter(grp_nn==grp_nn2))+
+        facet_grid(
+          index~.,scale="free"
+        )+
+        geom_boxplot(
+          aes(x=grp_nn,y=dis,fill=sp_range),
+          alpha=0.5,show.legend = F
+        )+
+        geom_hline(
+          data=tibble(
+            index=c(
+              "bNRI","bNRI","bNTI","bNTI","RCbray","RCbray"
+            ),
+            yinter=c(1.96,-1.96,1.96,-1.96,0.95,-0.95)
+          ),
+          aes(yintercept = yinter),
+          linetype=2,
+          linewidth=0.25,
+          color="red"
+        )+
+        geom_blank(
+          data=figdata %>% 
+            group_by(index) %>% 
+            filter(dis==max(dis)|dis==min(dis)),
+          aes(x=1,y=dis)
+        )+
+        scale_x_discrete(label=w09_assem$grp_nn_lab)+
+        scale_y_continuous(position = "right")+
+        theme_bw()+
+        theme(
+          text=element_text(family="serif",size=16),
+          legend.title = element_blank(),
+          strip.text = element_blank(),
+          strip.background = element_blank()
+        )+
+        labs(x="proportion of non-native fish",y=NULL)
+    )
+  ) %>% 
+  select(weight,fig)
+```
+
+The figure data of MRM
+```{r}
+w09_assem$figdat_mrm <- w09_assem$dat %>% 
+  rowwise() %>% 
+  mutate(
+    lm=list(
+      lm(
+        data=c(
+          list(y=as.dist(dis) %>% as.vector()),
+          w09_assem$var
+        ) %>% 
+          as_tibble(),
+        y~non_native_ratio_dis+
+          env_dis+
+          geo_dis+
+          exp_dis+
+          non_native_ratio_mean+
+          hfp_mean+
+          ph_mean+
+          do_mean+
+          salinity_mean+
+          turbidity_mean+
+          wt_mean+
+          longitude_mean+
+          latitude_mean+
+          filtration_volume_mean+
+          total_reads_mean
+      )
+    ),
+    coe=coef(lm)[["non_native_ratio_mean"]],
+    point=list(
+      tibble(
+        sp_range=sp_range,
+        index=index,
+        x=w09_assem$var$non_native_ratio_mean,
+        y=residuals(lm)+x*coe
+      )
+    ),
+    line=list(
+      tibble(
+        sp_range=sp_range,
+        index=index,
+        x=seq(
+          min(w09_assem$var$non_native_ratio_mean),
+          max(w09_assem$var$non_native_ratio_mean),
+          length=10
+        ),
+        y=x*coe
+      )
+    ),
+    text=list(
+      tibble(
+        sp_range=sp_range,
+        index=index,
+        p=mrm$coef["non_native_ratio_mean","pval"],
+        p_lab=case_when(
+          p<=0.001 ~ sprintf("coef=%.3f, p=%.3f***",coe,p),
+          p<=0.01 ~ sprintf("coef=%.3f, p=%.3f**",coe,p),
+          p<=0.05 ~ sprintf("coef=%.3f, p=%.3f*",coe,p),
+          .default = sprintf("coef=%.3f, p=%.3f",coe,p)
+        )
+      )
+    )
+  )
+
+w09_assem$figdat_mrm_ses <- w09_assem$figdat_mrm %>% 
+  filter(type=="ses") %>% 
+  group_by(weight) %>% 
+  summarise(
+    point=list(list_rbind(point)),
+    line=list(list_rbind(line)),
+    text=list(list_rbind(text))
+  )
+
+w09_assem$fig_mrm_ses <- w09_assem$figdat_mrm_ses %>% 
+  rowwise() %>% 
+  mutate(
+    fig=list(
+      ggplot(
+        data=point
+      )+
+        facet_grid(
+          index~sp_range,
+          scale="free",
+          labeller = labeller(
+            index = c(
+              bNRI = "βNRI",
+              bNTI = "βNTI",
+              RCbray = "RCbray"
+            )
+          )
+        )+
+        geom_hex(
+          aes(x=x,y=y),
+          bins=50
+        )+
+        geom_line(
+          data=line,
+          aes(x=x,y=y,col=sp_range),
+          linewidth=0.75,show.legend = F
+        )+
+        geom_label(
+          data=text,
+          aes(x=Inf,y=-Inf,label=p_lab),
+          hjust=1,vjust=0,family="serif",size=5
+        )+
+        scale_fill_viridis_c()+
+        labs(
+          x="proportion of non-native fish",
+          y=NULL,
+          title = ifelse(
+            weight,
+            "B. Relative abundance weighting",
+            "D. Unweighted"
+          )
+        )+
+        theme_bw()+
+        theme(
+          text=element_text(family="serif",size=16),
+          strip.text.x = element_blank(),
+          strip.background.x = element_blank()
+        )
+    )
+  ) %>% 
+  select(weight,fig)
+
+w09_assem$figdat_mrm_obs <- w09_assem$figdat_mrm %>% 
+  filter(type=="obs") %>% 
+  group_by(weight) %>% 
+  summarise(
+    point=list(list_rbind(point)),
+    line=list(list_rbind(line)),
+    text=list(list_rbind(text))
+  )
+
+w09_assem$fig_mrm_obs <- w09_assem$figdat_mrm_obs %>% 
+  rowwise() %>% 
+  mutate(
+    fig=list(
+      ggplot(
+        data=point
+      )+
+        facet_grid(
+          index~sp_range,
+          scale="free",
+          labeller = labeller(
+            index = c(
+              bNRI = "βMPD",
+              bNTI = "βMNTD",
+              RCbray = "Bray-Curtis"
+            ),
+            sp_range=c(
+              All="All fish species",
+              Native="Native fish species"
+            )
+          )
+        )+
+        geom_hex(
+          aes(x=x,y=y),
+          bins=50
+        )+
+        geom_line(
+          data=line,
+          aes(x=x,y=y,col=sp_range),
+          linewidth=0.75,show.legend = F
+        )+
+        geom_label(
+          data=text,
+          aes(x=Inf,y=-Inf,label=p_lab),
+          hjust=1,vjust=0,family="serif",size=5
+        )+
+        scale_fill_viridis_c()+
+        labs(
+          x="proportion of non-native fish",
+          y=NULL,
+          title = ifelse(
+            weight,
+            "B. Relative abundance weighting",
+            "D. Unweighted"
+          )
+        )+
+        theme_bw()+
+        theme(
+          text=element_text(family="serif",size=16)
+        )
+    )
+  ) %>% 
+  select(weight,fig)
+```
+
+Table data
+```{r}
+w09_assem$tab_mrm_smry <- w09_assem$dat %>% 
+  rowwise() %>% 
+  mutate(
+    mrm_smry=list(
+      mrm[["coef"]] %>% 
+        as.data.frame() %>% 
+        rownames_to_column("Terms")
+    )
+  ) %>% 
+  select(sp_range,weight,index,type,mrm_smry) %>% 
+  unnest(mrm_smry) %>% 
+  rename(
+    Estimate=y,
+    P=pval
+  ) %>% 
+  mutate(
+    P=case_when(
+      P <= 0.001 ~ str_c(P,"***"),
+      P <= 0.01  ~ str_c(P,"**"),
+      P <= 0.05  ~ str_c(P,"*"),
+      .default = as.character(P)
+    ),
+    index=case_when(
+      type=="obs" & index=="bNRI" ~ "βMPD",
+      type=="obs" & index=="bNTI" ~ "βMNTD",
+      type=="obs" & index=="RCbray" ~ "Bray-Curtis",
+      .default = str_replace(index,"^b","β")
+    )
+  ) %>% 
+  pivot_wider(
+    names_from = sp_range,
+    values_from = c(Estimate,P)
+  ) %>% 
+  nest_by(weight,type) %>% 
+  rowwise() %>% 
+  mutate(
+    tab=list(
+      data %>% 
+        gt(
+          groupname_col = "index",
+          row_group_as_column=T
+        ) %>% 
+        tab_spanner(
+          label="All fish species",
+          columns=c(
+            Estimate_All,P_All
+          )
+        ) %>% 
+        tab_spanner(
+          label="Native fish species",
+          columns=c(
+            Estimate_Native,P_Native
+          )
+        ) %>% 
+        cols_label(
+          Estimate_All="Estimate",
+          P_All="P",
+          Estimate_Native="Estimate",
+          P_Native="P"
+        ) %>% 
+        fmt_scientific(
+          columns = starts_with("Estimate"),
+          decimals = 2
+        ) %>% 
+        tab_options(row_group.as_column = TRUE) 
+    )
+  )
+```
+
+
+### Figure 7
+```{r}
+#| fig-cap: "Figure 7"
+#| fig-width: 16
+#| fig-height: 16
+
+w09_assem$fig_hline <- wrap_elements(
+  full = grid::segmentsGrob(
+    x0 = unit(0, "npc"), y0 = unit(0.5, "npc"), 
+    x1 = unit(1, "npc"), y1 = unit(0.5, "npc"),
+    gp = grid::gpar(col = "gray30", lwd = 0.8, lty = "solid")
+  )
+)
+
+fig7 <- (
+  filter(w09_assem$fig_density,weight)$fig[[1]]+
+    filter(w09_assem$fig_boxplot,weight)$fig[[1]]+
+    filter(w09_assem$fig_mrm_ses,weight)$fig[[1]]+
+    plot_layout(
+      guides = "collect",widths = c(1,6,5)
+    )
+)/w09_assem$fig_hline/(
+  filter(w09_assem$fig_density,!weight)$fig[[1]]+
+    filter(w09_assem$fig_boxplot,!weight)$fig[[1]]+
+    filter(w09_assem$fig_mrm_ses,!weight)$fig[[1]]+
+    plot_layout(
+      guides = "collect",widths = c(1,6,5)
+    )
+)+plot_layout(heights = c(1,0.01,1))
+ggsave(
+  "./output/Figure_7_assem.svg",
+  fig7,
+  width = 16,height = 16,device = svglite
+)
+ggsave(
+  "./output/Figure_7_assem.pdf",
+  fig7,
+  width = 16,height = 16
+)
+
+fig7
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S23
+ses_weighted
+```{r}
+#| tbl-cap: "Supplementary Table 23. MRM coefficients for relative abundance weighted βNRI, βNTI, and RCbray."
+
+tabs23 <- w09_assem$tab_mrm_smry %>% 
+  filter(type=="ses",weight) %>% 
+  pull(tab) %>% 
+  .[[1]]
+tabs23
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S24
+ses_unweighted
+```{r}
+#| tbl-cap: "Supplementary Table 24. MRM coefficients for unweighted βNRI, βNTI, and RCbray."
+
+tabs24 <- w09_assem$tab_mrm_smry %>% 
+  filter(type=="ses",!weight) %>% 
+  pull(tab) %>% 
+  .[[1]]
+tabs24
+```
+
+```{=latex}
+\clearpage
+```
+
+## w10_nmds
+Prepare data
+```{r}
+
+set.seed(202607)
+
+w10_nmds <- list()
+
+w10_nmds$nmds <- w09_assem$dat %>% 
+  filter(type=="obs") %>% 
+  rowwise() %>% 
+  mutate(dis=list(as.dist(dis))) %>%
+  select(sp_range,index,weight,dis) %>%
+  mutate(
+    nmds=list(
+      metaMDS(dis,k=2,trymax=99,trace=0)
+    ),
+    adonis=list(
+      adonis2(
+        dis~non_native_ratio+
+          hfp+ph+do+habitat+season+turbidity+salinity+
+          longitude*latitude,
+        data=sample_info,
+        by="margin",
+        permutation=999,
+        add="cailliez"
+      ) %>% 
+        as.data.frame() %>% 
+        rownames_to_column("Terms")
+    ),
+    betadis=list(
+      betadisper(
+        dis,
+        sample_info$grp_nn,
+        add="cailliez"
+      ) 
+    ),
+    betadis_tukey=list(
+      TukeyHSD(betadis)$group %>% 
+        as.data.frame()
+    )
+  )
+```
+
+NMDS visualization
+```{r}
+w10_nmds$figdata_nmds <- w10_nmds$nmds %>% 
+  rowwise() %>% 
+  mutate(
+    score_sample=list(
+      scores(nmds,display="site") %>% 
+        as.data.frame() %>% 
+        rownames_to_column("exp_id") %>% 
+        left_join(
+          select(sample_info,exp_id,habitat,season,grp_nn),
+          by="exp_id"
+        ) %>% 
+        mutate(
+          sp_range=sp_range,
+          index=index
+        ) %>% 
+        group_by(sp_range,index) %>% 
+        mutate(
+          scale_max = max(abs(c(NMDS1, NMDS2))),
+          NMDS1 = NMDS1/scale_max,
+          NMDS2 = NMDS2/scale_max
+        ) %>% 
+        ungroup()
+    ),
+    stress_lab=list(
+      tibble(
+        sp_range=sp_range,
+        index=index,
+        stress_lab=sprintf("Stress = %.3f",nmds$stress)
+      )
+    )
+  ) %>% 
+  group_by(weight) %>% 
+  summarise(
+    score_sample=list(list_rbind(score_sample)),
+    stress_lab=list(list_rbind(stress_lab))
+  )
+
+w10_nmds$fig_nmds <- w10_nmds$figdata_nmds %>% 
+  rowwise() %>% 
+  mutate(
+    fig=list(
+      ggplot(data=score_sample)+
+        facet_grid(
+          index~sp_range,
+          switch = "y",
+          scales = "free",
+          labeller = labeller(
+            sp_range = c(
+              All = "All fish species",
+              Native = "Native fish species"
+            ),
+            index = c(
+              bNRI = "βMPD",
+              bNTI = "βMNTD",
+              RCbray = "Bray-Curtis"
+            )
+          )
+        )+
+        geom_point(
+          aes(x=NMDS1,y=NMDS2,col=grp_nn),
+          alpha=0.75,size=1
+        )+
+        stat_ellipse(
+          aes(x=NMDS1,y=NMDS2,fill=grp_nn,color = grp_nn),
+          geom="polygon",level=0.95,alpha=0.1
+        )+
+        geom_point(
+          data=score_sample %>% 
+            summarise(
+              x=mean(NMDS1),y=mean(NMDS2),
+              .by=c(sp_range,index,grp_nn)
+            ),
+          aes(x=x,y=y,fill=grp_nn),
+          col="black",
+          size=2,
+          shape=23
+        )+
+        geom_text(
+          data=stress_lab,
+          aes(x=Inf,y=Inf,label=stress_lab),
+          hjust=1.2,vjust=1.5,size=5,family="serif"
+        )+
+        scale_color_discrete(labels = w09_assem$grp_nn_lab)+
+        scale_fill_discrete(labels = w09_assem$grp_nn_lab)+
+        scale_y_continuous(position = "right")+
+        labs(
+          y=NULL,
+          color = "proportion of \nnon-native fish",
+          fill = "proportion of \nnon-native fish",
+          title = ifelse(
+            weight,
+            "A. Relative abundance weighting",
+            "C. Unweighted"
+          )
+        )+
+        theme_bw()+
+        theme(
+          text=element_text(size=16,family="serif"),
+          panel.grid=element_blank()
+        )
+    )
+  ) %>% 
+  select(weight,fig)
+```
+
+Permanova table data
+```{r}
+
+w10_nmds$tab_adonis <- w10_nmds$nmds %>% 
+  select(c(sp_range,index,weight,adonis)) %>% 
+  unnest(adonis) %>% 
+  mutate(
+    index=case_when(
+      index=="bNRI" ~ "βMPD",
+      index=="bNTI" ~ "βMNTD",
+      .default = "Bray-Curtis"
+    ),
+    Terms=case_when(
+      Terms=="non_native_ratio" ~ "proportion of non-native fish",
+      Terms=="hfp" ~ "Human Footprint",
+      Terms=="ph" ~ "pH",
+      Terms=="do" ~ "Do",
+      Terms=="habitat" ~ "Habitat",
+      Terms=="season" ~ "Season",
+      Terms=="turbidity" ~ "Turbidity",
+      Terms=="salinity" ~ "Salinity",
+      Terms=="longitude:latitude" ~ "Longitude:Latitude",
+      .default = Terms
+    ),
+    `Pr(>F)`=case_when(
+      `Pr(>F)`<=0.001 ~ str_c(`Pr(>F)`, "***"),
+      `Pr(>F)`<=0.01  ~ str_c(`Pr(>F)`, "**"),
+      `Pr(>F)`<=0.05  ~ str_c(`Pr(>F)`, "*"),
+      .default = as.character(`Pr(>F)`)
+    )
+  ) %>% 
+  pivot_wider(
+    names_from = sp_range,
+    values_from = c(Df,SumOfSqs,R2,`F`,`Pr(>F)`)
+  ) %>% 
+  nest(tabdat=!c(weight)) %>% 
+  rowwise() %>% 
+  mutate(
+    tab=list(
+      gt(
+        tabdat,
+        groupname_col = "index",
+        row_group_as_column=T
+      ) %>% 
+        tab_spanner(
+          label="All fish species",
+          columns = c(
+            Df_All,SumOfSqs_All,R2_All,F_All,`Pr(>F)_All`
+          )
+        ) %>% 
+        tab_spanner(
+          label="Native fish species",
+          columns = c(
+            Df_Native,SumOfSqs_Native,
+            R2_Native,F_Native,`Pr(>F)_Native`
+          )
+        ) %>% 
+        cols_label(
+          Df_All="Df",
+          SumOfSqs_All="SumOfSqs",
+          R2_All="R2",
+          F_All="F",
+          `Pr(>F)_All`="Pr(>F)",
+          Df_Native="Df",
+          SumOfSqs_Native="SumOfSqs",
+          R2_Native="R2",
+          F_Native="F",
+          `Pr(>F)_Native`="Pr(>F)"
+        ) %>% 
+        fmt_number(
+          columns = starts_with(c("SumOfSqs", "F")),
+          decimals = 2
+        ) %>%
+        fmt_number(
+          columns = starts_with("R2"),
+          decimals = 4
+        ) %>% 
+        sub_missing(missing_text = "") %>% 
+        cols_hide(columns = starts_with("SumOfSqs"))
+    )
+  )
+```
+
+
+### Figure 6
+```{r}
+#| fig-cap: "Figure 6"
+#| fig-width: 17.6
+#| fig-height: 22
+
+fig6 <- (
+  filter(w10_nmds$fig_nmds,weight)$fig[[1]]+
+    filter(w09_assem$fig_mrm_obs,weight)$fig[[1]]+
+    plot_layout(widths=c(2,1.8),guides = "collect")
+)/w09_assem$fig_hline/(
+  filter(w10_nmds$fig_nmds,!weight)$fig[[1]]+
+    filter(w09_assem$fig_mrm_obs,!weight)$fig[[1]]+
+    plot_layout(widths=c(2,1.8),guides = "collect")
+)+plot_layout(heights = c(1,0.01,1))
+
+ggsave(
+  "./output/Figure_6_nmds.svg",
+  fig6,
+  width = 17.6,
+  height = 22,device = svglite
+)
+ggsave(
+  "./output/Figure_6_nmds.pdf",
+  fig6,
+  width = 17.6,
+  height = 22
+)
+
+fig6
+```
+
+### Figure S8
+Prepare the plotting data and visualize betadisper
+```{r}
+#| fig-cap: "Supplementary Figure 8. Boxplots of distance to centroid by group."
+#| fig-width: 12
+#| fig-height: 16
+
+w10_nmds$figdat_betadis <- w10_nmds$nmds %>% 
+  rowwise() %>% 
+  mutate(
+    figdat_boxplot=list(
+      tibble(
+        dis=scale(betadis$distances),
+        grp_nn=betadis$group,
+        sp_range=sp_range,
+        index=index,
+        weight=weight
+      )
+    ),
+    figdat_cld=list(
+      betadis_tukey$`p adj` %>%
+        set_names(rownames(betadis_tukey)) %>%
+        multcompView::multcompLetters() %>%
+        .[["Letters"]] %>%
+        enframe(name="grp_nn",value="cld") %>%
+        mutate(
+          sp_range=sp_range,
+          index=index,
+          weight=weight,
+          y=max(figdat_boxplot$dis)*1.1
+        )
+    )
+  ) %>% 
+  ungroup() %>% 
+  group_by(weight) %>% 
+  summarise(
+    figdat_boxplot=list(list_rbind(figdat_boxplot)),
+    figdat_cld=list(list_rbind(figdat_cld))
+  ) %>% 
+  rowwise() %>% 
+  mutate(
+    fig=list(
+      ggplot(figdat_boxplot)+
+        facet_grid(
+          index~sp_range,scale="free",
+          labeller=labeller(
+            sp_range=c(
+              All = "All fish species",
+              Native = "Native fish species"
+            ),
+            index=c(
+              bNRI = "βMPD",
+              bNTI = "βMNTD",
+              RCbray = "Bray-Curtis"
+            )
+          )
+        )+
+        geom_boxplot(aes(x=grp_nn,y=dis,col=grp_nn),show.legend = F)+
+        geom_text(
+          data=figdat_cld,
+          aes(x=grp_nn,y=y,label = cld),
+          size=6,family="serif"
+        )+
+        labs(
+          x="proportion of non-native fish",
+          y="Distance to centroid",
+          title=ifelse(
+            weight,
+            "A. Relative abundance weighting",
+            "B. Unweighted"
+          )
+        )+
+        scale_x_discrete(label=w09_assem$grp_nn_lab)+
+        theme_bw()+
+        theme(
+          text=element_text(size=16,family="serif")
+        )
+    )
+  )
+
+figs8 <- filter(w10_nmds$figdat_betadis,weight)$fig[[1]]/
+  w09_assem$fig_hline/
+  filter(w10_nmds$figdat_betadis,!weight)$fig[[1]]+
+  plot_layout(heights = c(1,0.01,1))
+
+ggsave(
+  "./output/Figure_S8_betadisper.svg",
+  figs8,
+  width = 12,
+  height = 16,device = svglite
+)
+ggsave(
+  "./output/Figure_S8_betadisper.pdf",
+  figs8,
+  width = 12,
+  height = 16
+)
+
+figs8
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S19
+obs_weighted
+```{r}
+#| tbl-cap: "Supplementary Table 19. MRM coefficients for relative abundance weighted βMPD, βMNTD, and Bray-Curtis dissimilarity."
+
+tabs19 <- w09_assem$tab_mrm_smry %>% 
+  filter(type=="obs",weight) %>% 
+  pull(tab) %>% 
+  .[[1]]
+tabs19
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table S20
+obs_unweighted
+```{r}
+#| tbl-cap: "Supplementary Table 20. MRM coefficients for unweighted βMPD, βMNTD, and Bray-Curtis dissimilarity."
+
+tabs20 <- w09_assem$tab_mrm_smry %>% 
+  filter(type=="obs",!weight) %>% 
+  pull(tab) %>% 
+  .[[1]]
+tabs20
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table s21
+```{r}
+#| tbl-cap: "Supplementary Table 21. Permutational multivariate analysis of variance using relative abundance-weighted βMPD, βMNTD and Bray-Curtis dissimilarity."
+
+tabs21 <- w10_nmds$tab_adonis %>% 
+  filter(weight) %>% 
+  pull(tab) %>% 
+  .[[1]]
+tabs21
+```
+
+```{=latex}
+\clearpage
+```
+
+### Table s22
+```{r}
+#| tbl-cap: "Supplementary Table 22. Permutational multivariate analysis of variance using unweighted βMPD, βMNTD and Bray-Curtis dissimilarity."
+
+tabs22 <- w10_nmds$tab_adonis %>% 
+  filter(!weight) %>% 
+  pull(tab) %>% 
+  .[[1]]
+tabs22
+```
+
+```{=latex}
+\clearpage
+```
+
+## w11_node
+Prepare data
+```{r}
+w11_node <- list()
+
+w11_node$fish_table_native <- fish_table %>% 
+  select(
+    any_of(filter(fish_info,!non_native)$species_ns)
+  ) %>% 
+  mfc() %>% 
+  decostand("total")
+
+w11_node$sample_info_rank <- sample_info %>% 
+  mutate(
+    across(
+      c(
+        non_native_ratio,
+        hfp,
+        ph,
+        do,
+        longitude,
+        latitude,
+        salinity,
+        turbidity,
+        filtration_volume,
+        total_reads
+      ),
+      ~rank(.x)
+    )
+  ) %>% 
+  mutate(
+    longitude=scale(longitude),
+    latitude=scale(latitude)
+  )
+
+w11_node$tree_native <- w04_tree$tree_without_stars %>% 
+  keep.tip(colnames(w11_node$fish_table_native))
+```
+
+Calculate the rank regression of the total relative abundance of native fish for each node with the covariates, and extract the residuals
+```{r}
+w11_node$node_resi <- with(
+  w11_node,
+  Ntip(tree_native) + seq_len(Nnode(tree_native))[-1]
+) %>% 
+  set_names(str_c("node_",.)) %>% 
+  map(~extract.clade(w11_node$tree_native,.x)) %>% 
+  map("tip.label") %>% 
+  map(~w11_node$fish_table_native[,.x]) %>% 
+  map(rowSums) %>% 
+  map(rank) %>% 
+  map(as_tibble_col) %>% 
+  map(~bind_cols(.x,w11_node$sample_info_rank)) %>% 
+  map(
+    ~lm(
+      data=.x,
+      value~hfp+
+        ph+
+        do+
+        salinity+
+        turbidity+
+        longitude*latitude+
+        season+
+        habitat+
+        filtration_volume+
+        total_reads
+    )
+  ) %>% 
+  map(residuals) %>% 
+  as_tibble() %>%
+  as.matrix()
+```
+
+Perform rank regression of the relative abundance of exotic fish with covariates, and extract the residuals
+```{r}
+w11_node$non_native_resi <- lm(
+  data=w11_node$sample_info_rank,
+  non_native_ratio~hfp+
+    ph+
+    do+
+    salinity+
+    turbidity+
+    longitude*latitude+
+    season+
+    habitat+
+    filtration_volume+
+    total_reads
+) %>% 
+  residuals()
+```
+
+Calculate the correlation between the residual values of native fish and those of non-native fish at each node.
+```{r}
+w11_node$cor_result <- w11_node$node_resi %>% 
+  as_tibble() %>%
+  map(~cor.test(.x,w11_node$non_native_resi)) %>% 
+  map(
+    ~tibble(
+      rho=.x$estimate,
+      p_raw=.x$p.value
+    )
+  ) %>% 
+  list_rbind(names_to = "node_subtree") %>% 
+  mutate(
+    node_subtree=as.numeric(str_extract(node_subtree,"\\d+")),
+    p_adj_bh=p.adjust(p_raw,method="BH")
+  )
+```
+
+Performed 9999 permutations on the residual of the non-native fish to obtain the null distribution of the absolute value of the maximum correlation.
+```{r}
+w11_node$rho_nulldist <- replicate(
+  9999,
+  {
+    cor(
+      w11_node$node_resi,
+      sample(w11_node$non_native_resi)
+    ) %>%
+      max()
+  }
+)
+```
+
+Calculate the p-value of the permutation.
+```{r}
+w11_node$cor_result <- w11_node$cor_result %>% 
+  rowwise() %>% 
+  mutate(
+    p_perm=(sum(w11_node$rho_nulldist>=abs(rho))+1)/10000,
+    p_lab=case_when(
+      p_perm <= 0.001 ~ "***",
+      p_perm <= 0.01  ~ "**",
+      p_perm <= 0.05  ~ "*",
+      .default = ""
+    )
+  ) %>% 
+  ungroup() %>% 
+  arrange(p_perm)
+```
+
+Visualize the result of the permutation.
+```{r}
+w11_node$cor_result <- w11_node$cor_result %>% 
+  mutate(
+    node=map(
+      node_subtree,
+      ~extract.clade(w11_node$tree_native,.x)
+    ) %>% 
+      map("tip.label") %>% 
+      map_dbl(
+        ~getMRCA(w04_tree$tree_without_stars,.x)
+      )
+  ) %>% 
+  left_join(
+    w04_tree$dat_tree,by="node"
+  )
+
+w11_node$fig_tree <- ggtree(
+  w04_tree$tree,
+  linewidth=0.2
+) %<+% w04_tree$node_sp +
+  geom_tiplab(
+    align = T,
+    linesize=0.1,
+    family="serif",
+    fontface=3,
+    size=3.3,
+    aes(colour=non_native)
+  )+
+  scale_colour_manual(
+    values=c("TRUE"="#F8766D", "FALSE"="#00BFC4"), 
+    guide="none"
+  )+
+  new_scale_color() +
+  geom_cladelab(
+    data=w04_tree$node_order%>% rename(order2="order"),
+    mapping=aes(node=node, label=order2, col=order2),
+    offset=100,
+    fontsize=3.3,
+    family="serif",
+    show.legend=F
+  )+
+  geom_hilight(
+    data=w04_tree$node_order %>% rename(order3="order"),
+    aes(node=node,fill=order3),
+    alpha = 0.1,
+    show.legend = F
+  )+
+  new_scale_fill()+
+  geom_nodepoint(
+    data=w11_node$cor_result,
+    mapping=aes(x=x,y=y,fill=rho),
+    shape=21,col="black",size=4
+  )+
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0
+  )+
+  geom_text2(
+    data=w11_node$cor_result,
+    mapping=aes(x=x,y=y,label=p_lab),
+    nudge_y=0.5,size=5,family="serif",fontface = "bold"
+  )+
+  theme_tree2(
+    legend.position = "inside",
+    legend.position.inside = c(0.1, 0.90),
+    legend.justification = c("left","top")
+  )+
+  xlim(NA,max(node.depth.edgelength(w11_node$tree_native))*1.8)
+```
+
+### Figure 2
+```{r}
+#| fig-cap: "Figure 2"
+#| fig-width: 9
+#| fig-height: 12
+
+fig2 <- w11_node$fig_tree + 
+  w05_domi$fig_domi_all_v + 
+  plot_layout(widths=c(5,1))
+
+ggsave(
+  "./output/Figure_2_tree.svg",
+  fig2,
+  width = 9,
+  height = 12,device = svglite
+)
+ggsave(
+  "./output/Figure_2_tree.pdf",
+  fig2,
+  width = 9,
+  height = 12
+)
+
+fig2
+```
+
+## Source_data
+```{r}
+openxlsx::write.xlsx(
+  file="./output/Source_Data.xlsx",
+  x=list(
+    fig1a = sample_info %>% 
+      group_by(site,habitat,longitude,latitude) %>% 
+      summarise(
+        non_native_ratio=mean(non_native_ratio),
+        .groups = "drop"
+      ),
+    fig1b = list_rbind(w03_pca_env$score$scaling2),
+    fig1c = w01_read$figdat_read,
+    fig1d = w01_read$dat,
+    fig2left = w11_node$cor_result,
+    fig2right = w05_domi$domi_all,
+    fig3a_line = w06_distribution$dat_fit,
+    fig3a_point = w06_distribution$dat_resi %>% filter(fit_resi<=4),
+    fig3b = w06_distribution$figdat_boxplot,
+    fig4a = w07_src$dat_fitted_3d,
+    fig4b = w07_src$dat_src,
+    fig4c = w07_src$dat_src %>% 
+      filter(type!="sSBRC") %>% 
+      select(!c(lw,up)) %>% 
+      pivot_wider(
+        names_from = type,values_from = richness
+      ),
+    fig4d_line = w07_src$dat_sar,
+    fig4d_point = w07_src$dat_ref,
+    fig4e_line = w07_src$dat_intensity,
+    fig4e_point = w07_src$dat_threshold,
+    fig5_line = w08_alpha$ptresi$fit,
+    fig5_point = w08_alpha$ptresi$raw %>% filter(y >= -1.5),
+    fig6a = filter(w10_nmds$figdata_nmds,weight)$score_sample[[1]],
+    fig6b_line = filter(w09_assem$figdat_mrm_obs,weight)$line[[1]],
+    fig6b_point = filter(w09_assem$figdat_mrm_obs,weight)$point[[1]],
+    fig6c = filter(w10_nmds$figdata_nmds,!weight)$score_sample[[1]],
+    fig6d_line = filter(w09_assem$figdat_mrm_obs,!weight)$line[[1]],
+    fig6d_point = filter(w09_assem$figdat_mrm_obs,!weight)$point[[1]],
+    fig7a_density = filter(w09_assem$figdat_ass,weight)$figdata[[1]],
+    fig7a_boxplot = filter(w09_assem$figdat_ass,weight)$figdata[[1]] %>% 
+      filter(grp_nn==grp_nn2),
+    fig7b_line = filter(w09_assem$figdat_mrm_ses,weight)$line[[1]],
+    fig7b_point = filter(w09_assem$figdat_mrm_ses,weight)$point[[1]],
+    fig7c_density = filter(w09_assem$figdat_ass,!weight)$figdata[[1]],
+    fig7c_boxplot = filter(w09_assem$figdat_ass,!weight)$figdata[[1]] %>% 
+      filter(grp_nn==grp_nn2),
+    fig7d_line = filter(w09_assem$figdat_mrm_ses,!weight)$line[[1]],
+    fig7d_point = filter(w09_assem$figdat_mrm_ses,!weight)$point[[1]],
+    figs1 = figs1$data %>% select(non_native_ratio),
+    figs2 = w05_domi$domi_season,
+    figs3 = w06_distribution$resi,
+    figs4a = w07_src$dat_cv,
+    figs4bcd = w07_src$est_point$dat_orig_sub %>% select(resi,sp,fit),
+    figs5 = w07_src$est_interval$para %>% drop_na(),
+    figs6a = w07_src$figdat_dis_sp,
+    figs6b = w07_src$figdat_dis_extra_sp,
+    figs6c = w07_src$figdat_dis_satu,
+    figs6d = w07_src$figdat_dis_undetected_exotic,
+    figs6e = w07_src$figdat_dis_inte,
+    figs7 = w08_alpha$resi,
+    figs8a = filter(w10_nmds$figdat_betadis,weight)$figdat_boxplot[[1]],
+    figs8b = filter(w10_nmds$figdat_betadis,!weight)$figdat_boxplot[[1]]
+  )
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
